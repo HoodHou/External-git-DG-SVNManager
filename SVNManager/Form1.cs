@@ -502,6 +502,9 @@ public partial class Form1 : Form
         _moreActionsMenu.Items.Add("冲突处理", null, async (_, _) => await RunConflictWorkflowAsync());
         _moreActionsMenu.Items.Add("文件历史", null, async (_, _) => await RunFileHistoryAsync());
         _moreActionsMenu.Items.Add(new ToolStripSeparator());
+        _moreActionsMenu.Items.Add("SVN Clean Up", null, async (_, _) => await RunCleanupAsync());
+        _moreActionsMenu.Items.Add("查看忽略清单", null, async (_, _) => await ShowIgnoreListAsync());
+        _moreActionsMenu.Items.Add(new ToolStripSeparator());
         _moreActionsMenu.Items.Add("全部文件：刷新", null, (_, _) => LoadAllFiles());
         _moreActionsMenu.Items.Add("检查工具更新", null, async (_, _) => await ShowToolUpdatePanelAsync());
         _moreActionsMenu.Items.Add("打开操作日志", null, (_, _) => OpenOperationLog());
@@ -585,6 +588,8 @@ public partial class Form1 : Form
         _changesListMenu.Items.Add("查看锁信息", null, async (_, _) => await ShowSelectedFileLockInfoAsync());
         _changesListMenu.Items.Add(new ToolStripSeparator());
         _changesListMenu.Items.Add("还原到 SVN 最新版本...", null, async (_, _) => await RevertSelectedStatusChangesToLatestAsync());
+        _changesListMenu.Items.Add("加入忽略清单", null, async (_, _) => await AddSelectedPathsToIgnoreAsync());
+        _changesListMenu.Items.Add("移出忽略清单", null, async (_, _) => await RemoveSelectedPathsFromIgnoreAsync());
         _changesListMenu.Opening += (_, args) =>
         {
             var selected = GetSelectedStatusChanges();
@@ -962,6 +967,296 @@ public partial class Form1 : Form
             MessageBoxIcon.Warning,
             MessageBoxDefaultButton.Button2);
         return result == DialogResult.OK;
+    }
+
+    private async Task RunCleanupAsync()
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        var workingCopy = _workingCopyText.Text.Trim();
+        OperationLogger.Log("CleanupStart", workingCopy, "svn cleanup");
+        var result = await RunSvnOperationAsync("正在执行 SVN Clean Up...", async () => await _svn.CleanupAsync(workingCopy));
+        OperationLogger.Log(result?.ExitCode == 0 ? "CleanupSuccess" : "CleanupFailed", workingCopy, "");
+        await RefreshStatusAsync();
+        LoadAllFiles();
+    }
+
+    private async Task ShowIgnoreListAsync()
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        var workingCopy = _workingCopyText.Text.Trim();
+        SetBusy(true, "正在读取忽略清单...");
+        try
+        {
+            var result = await _svn.GetIgnoreListAsync(workingCopy);
+            if (result.ExitCode == 0 && !string.IsNullOrWhiteSpace(result.StandardOutput))
+            {
+                WriteOutput(result.StandardOutput);
+                return;
+            }
+
+            if (result.ExitCode == 0 || IsMissingIgnoreProperty(result))
+            {
+                WriteOutput("当前工作副本没有设置 svn:ignore。");
+                return;
+            }
+
+            WriteOutput(result.CombinedOutput);
+            MessageBox.Show("读取忽略清单失败，请查看终端输出。", "执行失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private async Task AddSelectedPathsToIgnoreAsync()
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        var workingCopy = _workingCopyText.Text.Trim();
+        var selectedPaths = GetSelectedIgnoreCandidatePaths();
+        if (selectedPaths.Count == 0)
+        {
+            MessageBox.Show("请先在 File Status 或全部文件里选中要忽略的文件/文件夹。", "未选择路径", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var statusMap = (await _svn.GetStatusAsync(workingCopy))
+            .ToDictionary(change => NormalizeRelativePath(change.RelativePath), change => change.Status, StringComparer.OrdinalIgnoreCase);
+        var targetPairs = selectedPaths
+            .Select(path => new { Selected = path, Target = FindUnversionedIgnoreTarget(path, statusMap) })
+            .ToList();
+        var unversionedPaths = targetPairs
+            .Select(pair => pair.Target)
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Cast<string>()
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var skippedPaths = targetPairs
+            .Where(pair => string.IsNullOrWhiteSpace(pair.Target))
+            .Select(pair => pair.Selected)
+            .ToList();
+        if (unversionedPaths.Count == 0)
+        {
+            MessageBox.Show("选中的路径都不是“未加入版本控制”状态，不能加入 svn:ignore。", "不能忽略", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var message =
+            $"准备把 {unversionedPaths.Count} 个未加入版本控制的路径加入 svn:ignore。{Environment.NewLine}{Environment.NewLine}" +
+            string.Join(Environment.NewLine, unversionedPaths.Take(12)) +
+            (unversionedPaths.Count > 12 ? Environment.NewLine + "..." : "");
+        if (skippedPaths.Count > 0)
+        {
+            message += $"{Environment.NewLine}{Environment.NewLine}会跳过 {skippedPaths.Count} 个已受 SVN 管理或状态不明确的路径。";
+        }
+
+        if (MessageBox.Show(message, "加入忽略清单", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+        {
+            return;
+        }
+
+        var result = await UpdateIgnorePropertiesAsync(workingCopy, unversionedPaths, add: true);
+        OperationLogger.Log(result.ExitCode == 0 ? "AddIgnoreSuccess" : "AddIgnoreFailed", workingCopy, string.Join(" | ", unversionedPaths));
+        WriteOutput(result.CombinedOutput);
+        await RefreshStatusAsync();
+        LoadAllFiles();
+    }
+
+    private async Task RemoveSelectedPathsFromIgnoreAsync()
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        var selectedPaths = GetSelectedIgnoreCandidatePaths();
+        if (selectedPaths.Count == 0)
+        {
+            MessageBox.Show("请先在全部文件里选中要移出忽略清单的文件/文件夹。", "未选择路径", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var workingCopy = _workingCopyText.Text.Trim();
+        var message =
+            $"准备从 svn:ignore 里移除 {selectedPaths.Count} 个名称。{Environment.NewLine}{Environment.NewLine}" +
+            string.Join(Environment.NewLine, selectedPaths.Take(12)) +
+            (selectedPaths.Count > 12 ? Environment.NewLine + "..." : "");
+        if (MessageBox.Show(message, "移出忽略清单", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+        {
+            return;
+        }
+
+        var result = await UpdateIgnorePropertiesAsync(workingCopy, selectedPaths, add: false);
+        OperationLogger.Log(result.ExitCode == 0 ? "RemoveIgnoreSuccess" : "RemoveIgnoreFailed", workingCopy, string.Join(" | ", selectedPaths));
+        WriteOutput(result.CombinedOutput);
+        await RefreshStatusAsync();
+        LoadAllFiles();
+    }
+
+    private async Task<ProcessResult> UpdateIgnorePropertiesAsync(string workingCopy, IReadOnlyList<string> relativePaths, bool add)
+    {
+        SetBusy(true, add ? "正在加入忽略清单..." : "正在移出忽略清单...");
+        try
+        {
+            var output = new StringBuilder();
+            var exitCode = 0;
+            foreach (var group in BuildIgnoreGroups(relativePaths))
+            {
+                var current = await _svn.GetIgnoreAsync(workingCopy, group.ParentPath);
+                if (current.ExitCode != 0 && !IsMissingIgnoreProperty(current))
+                {
+                    output.AppendLine(current.CombinedOutput);
+                    exitCode = current.ExitCode;
+                    continue;
+                }
+
+                var names = ParseIgnoreNames(current.StandardOutput);
+                var changed = false;
+                foreach (var name in group.Names)
+                {
+                    if (add)
+                    {
+                        changed |= names.Add(name);
+                    }
+                    else
+                    {
+                        changed |= names.Remove(name);
+                    }
+                }
+
+                if (!changed)
+                {
+                    output.AppendLine($"{DisplayIgnoreParent(group.ParentPath)}：没有需要{(add ? "加入" : "移除")}的 ignore 项。");
+                    continue;
+                }
+
+                var update = await _svn.SetIgnoreAsync(workingCopy, group.ParentPath, names);
+                output.AppendLine(update.CombinedOutput);
+                if (update.ExitCode != 0)
+                {
+                    exitCode = update.ExitCode;
+                    continue;
+                }
+
+                output.AppendLine($"{DisplayIgnoreParent(group.ParentPath)}：已{(add ? "加入" : "移除")} {group.Names.Count} 项。");
+            }
+
+            return new ProcessResult(exitCode, output.ToString(), "");
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+            return new ProcessResult(-1, "", ex.Message);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private IReadOnlyList<string> GetSelectedIgnoreCandidatePaths()
+    {
+        var statusPaths = GetSelectedStatusChanges()
+            .Select(change => SvnConflictArtifact.NormalizeToBasePath(change.RelativePath));
+        var treePaths = GetSelectedFileTreeHistoryPaths();
+        return statusPaths.Concat(treePaths)
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Select(path => NormalizeRelativePath(path).Trim(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static string? FindUnversionedIgnoreTarget(string path, IReadOnlyDictionary<string, SvnStatusKind> statusMap)
+    {
+        var normalized = NormalizeRelativePath(path).Trim(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (statusMap.TryGetValue(normalized, out var status) && status == SvnStatusKind.Unversioned)
+        {
+            return normalized;
+        }
+
+        var current = normalized;
+        while (!string.IsNullOrWhiteSpace(current))
+        {
+            var parent = Path.GetDirectoryName(current);
+            if (string.IsNullOrWhiteSpace(parent))
+            {
+                return null;
+            }
+
+            parent = NormalizeRelativePath(parent).Trim(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            if (statusMap.TryGetValue(parent, out status) && status == SvnStatusKind.Unversioned)
+            {
+                return parent;
+            }
+
+            current = parent;
+        }
+
+        return null;
+    }
+
+    private static IReadOnlyList<IgnoreGroup> BuildIgnoreGroups(IEnumerable<string> relativePaths)
+    {
+        return relativePaths
+            .Select(path => NormalizeRelativePath(path).Trim(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .GroupBy(
+                path => NormalizeIgnoreParent(Path.GetDirectoryName(path)),
+                path => Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)),
+                StringComparer.OrdinalIgnoreCase)
+            .Select(group => new IgnoreGroup(
+                group.Key,
+                group.Where(name => !string.IsNullOrWhiteSpace(name))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+                    .ToList()))
+            .Where(group => group.Names.Count > 0)
+            .ToList();
+    }
+
+    private static HashSet<string> ParseIgnoreNames(string text)
+    {
+        return text
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(line => !string.IsNullOrWhiteSpace(line))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static bool IsMissingIgnoreProperty(ProcessResult result)
+    {
+        var text = result.CombinedOutput;
+        return text.Contains("W200017", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("not found", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("不存在", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizeIgnoreParent(string? path)
+    {
+        return string.IsNullOrWhiteSpace(path)
+            ? "."
+            : NormalizeRelativePath(path).Trim(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    }
+
+    private static string DisplayIgnoreParent(string parentPath)
+    {
+        return parentPath == "." ? "工作副本根目录" : parentPath;
     }
 
     private async Task RevertSelectedStatusChangesToLatestAsync()
@@ -3377,6 +3672,8 @@ try {{
         _fileTreeMenu.Items.Add("查看锁信息", null, async (_, _) => await ShowSelectedFileLockInfoAsync());
         _fileTreeMenu.Items.Add(new ToolStripSeparator());
         _fileTreeMenu.Items.Add("加入版本控制", null, async (_, _) => await AddSelectedTreeFileAsync());
+        _fileTreeMenu.Items.Add("加入忽略清单", null, async (_, _) => await AddSelectedPathsToIgnoreAsync());
+        _fileTreeMenu.Items.Add("移出忽略清单", null, async (_, _) => await RemoveSelectedPathsFromIgnoreAsync());
         _fileTreeMenu.Items.Add("标记冲突已解决", null, async (_, _) => await ResolveSelectedTreeFileAsync());
         _fileTreeMenu.Opening += (_, args) =>
         {
@@ -3398,6 +3695,8 @@ try {{
                     item.Text is "解锁文件" && hasFile ||
                     item.Text is "查看锁信息" && hasFile ||
                     item.Text is "加入版本控制" && hasFile ||
+                    item.Text is "加入忽略清单" && hasTreePath ||
+                    item.Text is "移出忽略清单" && hasTreePath ||
                     item.Text is "标记冲突已解决" && hasFile;
             }
         };
@@ -5199,6 +5498,11 @@ internal sealed class SvnClient
         return RunAsync(workingCopyPath, "update");
     }
 
+    public Task<ProcessResult> CleanupAsync(string workingCopyPath)
+    {
+        return RunAsync(workingCopyPath, "cleanup");
+    }
+
     public Task<ProcessResult> UpdateToRevisionAsync(string workingCopyPath, long revision)
     {
         return RunAsync(workingCopyPath, "update", "-r", revision.ToString());
@@ -5248,6 +5552,27 @@ internal sealed class SvnClient
     public Task<ProcessResult> AddAsync(string workingCopyPath, string relativePath)
     {
         return RunAsync(workingCopyPath, "add", relativePath);
+    }
+
+    public Task<ProcessResult> GetIgnoreListAsync(string workingCopyPath)
+    {
+        return RunTextAsync(workingCopyPath, "propget", "svn:ignore", "-R", ".");
+    }
+
+    public Task<ProcessResult> GetIgnoreAsync(string workingCopyPath, string parentPath)
+    {
+        return RunTextAsync(workingCopyPath, "propget", "svn:ignore", parentPath);
+    }
+
+    public Task<ProcessResult> SetIgnoreAsync(string workingCopyPath, string parentPath, IEnumerable<string> names)
+    {
+        var value = string.Join(Environment.NewLine, names
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase));
+        return string.IsNullOrWhiteSpace(value)
+            ? RunTextAsync(workingCopyPath, "propdel", "svn:ignore", parentPath)
+            : RunTextAsync(workingCopyPath, "propset", "svn:ignore", value, parentPath);
     }
 
     public Task<ProcessResult> ResolveAsync(string workingCopyPath, string relativePath)
@@ -7045,6 +7370,8 @@ internal sealed record ProcessResult(int ExitCode, string StandardOutput, string
 internal sealed record ConflictGridRow(string RelativePath, string Description);
 
 internal sealed record FileTreeNodeInfo(string RelativePath, bool IsFile);
+
+internal sealed record IgnoreGroup(string ParentPath, IReadOnlyList<string> Names);
 
 internal sealed class SettingsForm : Form
 {
