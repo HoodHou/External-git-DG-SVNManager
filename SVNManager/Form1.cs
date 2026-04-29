@@ -1,0 +1,6711 @@
+using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
+using System.Xml.Linq;
+using NPOI.SS.UserModel;
+
+namespace SVNManager;
+
+public partial class Form1 : Form
+{
+    private readonly ComboBox _repositorySelector = new();
+    private readonly TextBox _repoUrlText = new();
+    private readonly TextBox _workingCopyText = new();
+    private readonly TextBox _outputText = new();
+    private readonly ListView _changesList = new();
+    private readonly DataGridView _conflictGrid = new();
+    private readonly Label _conflictSummaryLabel = new();
+    private readonly TreeView _repositoryTree = new();
+    private readonly TreeView _fileTree = new();
+    private readonly TextBox _fileTreeSearchText = new();
+    private readonly CheckBox _fileTreeChangedOnlyCheck = new();
+    private readonly Button _fileTreeExpandButton = new();
+    private readonly Button _fileTreeCollapseButton = new();
+    private readonly Button _fileTreeRefreshButton = new();
+    private readonly ListView _historyList = new();
+    private readonly TextBox _historySearchText = new();
+    private readonly TextBox _historyDetailText = new();
+    private readonly TreeView _historyChangedFilesTree = new();
+    private readonly Panel _historyDiffPanel = new();
+    private readonly TabControl _mainTabs = new();
+    private readonly TabPage _statusPage = new("File Status");
+    private readonly TabPage _conflictPage = new("冲突");
+    private readonly TabPage _historyPage = new("History");
+    private readonly SplitContainer _workspaceSplit = new();
+    private readonly SplitContainer _historySplit = new();
+    private readonly SplitContainer _changedFilesSplit = new();
+    private readonly ContextMenuStrip _fileTreeMenu = new();
+    private readonly ContextMenuStrip _historyListMenu = new();
+    private readonly ContextMenuStrip _historyChangedFilesMenu = new();
+    private readonly Button _checkoutButton = new();
+    private readonly Button _updateButton = new();
+    private readonly Button _statusButton = new();
+    private readonly Button _commitButton = new();
+    private readonly Button _diffButton = new();
+    private readonly Button _externalMergeButton = new();
+    private readonly Button _conflictWorkflowButton = new();
+    private readonly Button _historyButton = new();
+    private readonly Button _moreActionsButton = new();
+    private readonly ContextMenuStrip _moreActionsMenu = new();
+    private readonly ImageList _treeImages = new();
+    private readonly ToolStripStatusLabel _statusLabel = new();
+    private readonly ToolStripStatusLabel _remoteStatusLabel = new();
+    private readonly System.Windows.Forms.Timer _remoteCheckTimer = new();
+    private readonly SvnClient _svn = new();
+    private readonly AppSettings _settings;
+    private bool _loadingRepository;
+    private bool _loadingFileTree;
+    private bool _checkingRemote;
+    private SvnLogEntry? _latestRemoteLog;
+    private readonly HashSet<string> _selectedFileTreePaths = new(StringComparer.OrdinalIgnoreCase);
+    private string? _fileTreeSelectionAnchorPath;
+    private SvnLogEntry? _selectedHistoryLog;
+    private List<SvnLogEntry> _selectedHistoryLogs = [];
+    private List<SvnLogEntry> _historyRows = [];
+    private List<SvnChange> _currentConflicts = [];
+    private readonly Dictionary<string, DiffPreviewData> _historyDiffPreviewCache = new(StringComparer.Ordinal);
+    private CancellationTokenSource? _historyDiffPreviewCts;
+    private const int MaxDiffPreviewCacheEntries = 40;
+
+    public Form1()
+    {
+        InitializeComponent();
+        _settings = AppSettings.Load();
+        BuildUi();
+        LoadSettingsIntoUi();
+        Shown += async (_, _) =>
+        {
+            RestoreUiLayout();
+            await LoadRepositoryHistoryAsync();
+            _remoteCheckTimer.Start();
+            await CheckRemoteChangesAsync(showUpToDateMessage: false);
+        };
+        FormClosing += (_, _) =>
+        {
+            _remoteCheckTimer.Stop();
+            CancelHistoryDiffPreview();
+            SaveUiLayout();
+        };
+    }
+
+    private void BuildUi()
+    {
+        Text = "梦境 SVN 管理器";
+        MinimumSize = new Size(1180, 760);
+        Size = new Size(1480, 900);
+        StartPosition = FormStartPosition.CenterScreen;
+        Font = new Font("Microsoft YaHei UI", 9F);
+        BackColor = Color.FromArgb(246, 248, 250);
+        ConfigureTreeImages();
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 4,
+            Padding = new Padding(12),
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 108));
+        Controls.Add(root);
+
+        var pathPanel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 3,
+            RowCount = 2,
+        };
+        pathPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
+        pathPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        pathPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 116));
+        pathPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+        pathPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+        root.Controls.Add(pathPanel, 0, 0);
+
+        pathPanel.Controls.Add(new Label { Text = "SVN 地址", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 0, 0);
+        _repoUrlText.Dock = DockStyle.Fill;
+        pathPanel.Controls.Add(_repoUrlText, 1, 0);
+        _checkoutButton.Text = "检出";
+        _checkoutButton.Dock = DockStyle.Fill;
+        _checkoutButton.Click += async (_, _) => await RunCheckoutAsync();
+        pathPanel.Controls.Add(_checkoutButton, 2, 0);
+
+        pathPanel.Controls.Add(new Label { Text = "本地目录", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 0, 1);
+        _workingCopyText.Dock = DockStyle.Fill;
+        pathPanel.Controls.Add(_workingCopyText, 1, 1);
+        var chooseButton = new Button { Text = "选择", Dock = DockStyle.Fill };
+        chooseButton.Click += (_, _) => ChooseWorkingCopy();
+        pathPanel.Controls.Add(chooseButton, 2, 1);
+
+        var toolbar = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Padding = new Padding(0, 6, 0, 0),
+            BackColor = Color.FromArgb(246, 248, 250),
+        };
+        root.Controls.Add(toolbar, 0, 1);
+
+        _repositorySelector.Width = 250;
+        _repositorySelector.DropDownStyle = ComboBoxStyle.DropDownList;
+        _repositorySelector.SelectedIndexChanged += (_, _) => SelectRepositoryFromList();
+        toolbar.Controls.Add(_repositorySelector);
+
+        var saveRepositoryButton = new Button { Text = "保存库", Width = 82 };
+        saveRepositoryButton.Click += (_, _) => SaveCurrentRepository();
+        toolbar.Controls.Add(saveRepositoryButton);
+
+        var removeRepositoryButton = new Button { Text = "移除", Width = 70 };
+        removeRepositoryButton.Click += (_, _) => RemoveCurrentRepository();
+        toolbar.Controls.Add(removeRepositoryButton);
+
+        _updateButton.Text = "拉取最新";
+        _updateButton.Width = 110;
+        _updateButton.Click += async (_, _) => await RunUpdateAsync();
+        toolbar.Controls.Add(_updateButton);
+
+        _statusButton.Text = "查看改动";
+        _statusButton.Width = 110;
+        _statusButton.Click += async (_, _) => await RefreshStatusAsync();
+        toolbar.Controls.Add(_statusButton);
+
+        _commitButton.Text = "提交选中文件";
+        _commitButton.Width = 130;
+        _commitButton.Click += async (_, _) => await RunCommitAsync();
+        toolbar.Controls.Add(_commitButton);
+
+        _diffButton.Text = "查看差异";
+        _diffButton.Width = 130;
+        _diffButton.Click += async (_, _) => await RunDiffAsync();
+
+        _externalMergeButton.Text = "外部对比/合并";
+        _externalMergeButton.Width = 130;
+        _externalMergeButton.Click += async (_, _) => await RunExternalCompareOrMergeAsync();
+
+        _conflictWorkflowButton.Text = "冲突处理";
+        _conflictWorkflowButton.Width = 100;
+        _conflictWorkflowButton.Click += async (_, _) => await RunConflictWorkflowAsync();
+
+        _historyButton.Text = "文件历史";
+        _historyButton.Width = 100;
+        _historyButton.Click += async (_, _) => await RunFileHistoryAsync();
+
+        var openFolderButton = new Button { Text = "打开目录", Width = 100 };
+        openFolderButton.Click += (_, _) => OpenWorkingCopyFolder();
+        toolbar.Controls.Add(openFolderButton);
+
+        BuildMoreActionsMenu();
+        _moreActionsButton.Text = "更多操作";
+        _moreActionsButton.Width = 96;
+        _moreActionsButton.Click += (_, _) => _moreActionsMenu.Show(_moreActionsButton, new Point(0, _moreActionsButton.Height));
+        toolbar.Controls.Add(_moreActionsButton);
+
+        _changesList.Dock = DockStyle.Fill;
+        _changesList.View = View.Details;
+        _changesList.FullRowSelect = true;
+        _changesList.GridLines = true;
+        _changesList.CheckBoxes = true;
+        _changesList.HideSelection = false;
+        _changesList.Columns.Add("状态", 90);
+        _changesList.Columns.Add("文件", 650);
+        _changesList.Columns.Add("说明", 260);
+
+        _workspaceSplit.Dock = DockStyle.Fill;
+        _workspaceSplit.SplitterDistance = 170;
+        _workspaceSplit.FixedPanel = FixedPanel.Panel1;
+        root.Controls.Add(_workspaceSplit, 0, 2);
+
+        _repositoryTree.Dock = DockStyle.Fill;
+        ConfigureNavigationTree(_repositoryTree);
+        _repositoryTree.ShowNodeToolTips = true;
+        _repositoryTree.ImageList = _treeImages;
+        _repositoryTree.AfterSelect += async (_, args) => await SelectSidebarRepositoryAsync(args.Node);
+        _workspaceSplit.Panel1.Controls.Add(_repositoryTree);
+        RefreshRepositoryTree();
+
+        _mainTabs.Dock = DockStyle.Fill;
+        _statusPage.Controls.Add(CreateStatusPanel());
+        _mainTabs.TabPages.Add(_statusPage);
+
+        _conflictPage.Controls.Add(CreateConflictPanel());
+        _mainTabs.TabPages.Add(_conflictPage);
+
+        _fileTree.Dock = DockStyle.Fill;
+        ConfigureNavigationTree(_fileTree);
+        _fileTree.ShowNodeToolTips = true;
+        _fileTree.ImageList = _treeImages;
+        _fileTree.TreeViewNodeSorter = new FileTreeNodeSorter();
+        _fileTree.NodeMouseDoubleClick += (_, args) => OpenTreeFile(args.Node);
+        _fileTree.AfterExpand += (_, _) => SaveTreeExpansionState();
+        _fileTree.AfterCollapse += (_, _) => SaveTreeExpansionState();
+        _fileTree.NodeMouseClick += (_, args) =>
+        {
+            HandleFileTreeNodeMouseClick(args.Node, args.Button);
+        };
+        BuildFileTreeMenu();
+        _fileTree.ContextMenuStrip = _fileTreeMenu;
+        var filesPage = new TabPage("全部文件");
+        filesPage.Controls.Add(CreateAllFilesPanel());
+        _mainTabs.TabPages.Add(filesPage);
+
+        _historySplit.Dock = DockStyle.Fill;
+        _historySplit.Orientation = Orientation.Horizontal;
+        _historySplit.SplitterDistance = 240;
+        var historyListPanel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+        };
+        historyListPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        historyListPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        _historySearchText.Dock = DockStyle.Fill;
+        _historySearchText.PlaceholderText = "搜索：file:文件 author:作者 rev:57100-57120 id:需求号 或普通关键词";
+        _historySearchText.Margin = new Padding(0, 0, 0, 4);
+        _historySearchText.TextChanged += (_, _) => ApplyHistoryFilter();
+        historyListPanel.Controls.Add(_historySearchText, 0, 0);
+
+        _historyList.Dock = DockStyle.Fill;
+        _historyList.View = View.Details;
+        _historyList.FullRowSelect = true;
+        _historyList.GridLines = true;
+        _historyList.HideSelection = false;
+        _historyList.BackColor = Color.White;
+        _historyList.Columns.Add("Graph", 70);
+        _historyList.Columns.Add("Description", 760);
+        _historyList.Columns.Add("Date", 150);
+        _historyList.Columns.Add("Author", 130);
+        _historyList.Columns.Add("Commit", 90);
+        _historyList.SelectedIndexChanged += (_, _) => ShowSelectedHistoryDetail();
+        _historyList.DoubleClick += (_, _) => FocusFirstChangedFileInSelectedHistory();
+        _historyList.MouseDown += (_, args) => SelectHistoryItemForContextMenu(args);
+        BuildHistoryListMenu();
+        _historyList.ContextMenuStrip = _historyListMenu;
+        historyListPanel.Controls.Add(_historyList, 0, 1);
+        _historySplit.Panel1.Controls.Add(CreateHistoryTopPanel(historyListPanel));
+
+        _changedFilesSplit.Dock = DockStyle.Fill;
+        _changedFilesSplit.SplitterDistance = 430;
+        _changedFilesSplit.FixedPanel = FixedPanel.Panel1;
+        _historyChangedFilesTree.Dock = DockStyle.Fill;
+        ConfigureNavigationTree(_historyChangedFilesTree);
+        _historyChangedFilesTree.ImageList = _treeImages;
+        _historyChangedFilesTree.TreeViewNodeSorter = new FileTreeNodeSorter();
+        _historyChangedFilesTree.NodeMouseClick += (_, args) =>
+        {
+            if (args.Button == MouseButtons.Right)
+            {
+                _historyChangedFilesTree.SelectedNode = args.Node;
+            }
+        };
+        _historyChangedFilesTree.NodeMouseDoubleClick += async (_, args) => await OpenHistoryChangedFileAsync(args.Node);
+        _historyChangedFilesTree.AfterSelect += async (_, args) => await ShowSelectedHistoryFileDiffAsync(args.Node);
+        BuildHistoryChangedFilesMenu();
+        _historyChangedFilesTree.ContextMenuStrip = _historyChangedFilesMenu;
+        _changedFilesSplit.Panel1.Controls.Add(CreateTitledPanel("Changed files", _historyChangedFilesTree));
+
+        _historyDiffPanel.Dock = DockStyle.Fill;
+        _historyDiffPanel.BackColor = Color.White;
+        _historyDetailText.Dock = DockStyle.Fill;
+        _historyDetailText.Multiline = true;
+        _historyDetailText.ReadOnly = true;
+        _historyDetailText.ScrollBars = ScrollBars.Both;
+        _historyDetailText.WordWrap = false;
+        _historyDiffPanel.Controls.Add(_historyDetailText);
+        _changedFilesSplit.Panel2.Controls.Add(CreateTitledPanel("Diff preview", _historyDiffPanel));
+        _historySplit.Panel2.Controls.Add(_changedFilesSplit);
+        _historyPage.Controls.Add(_historySplit);
+        _mainTabs.TabPages.Add(_historyPage);
+        _mainTabs.SelectedIndexChanged += async (_, _) => await LoadCurrentTabAsync();
+        _workspaceSplit.Panel2.Controls.Add(_mainTabs);
+
+        _outputText.Dock = DockStyle.Fill;
+        _outputText.Multiline = true;
+        _outputText.ReadOnly = true;
+        _outputText.ScrollBars = ScrollBars.Both;
+        _outputText.WordWrap = false;
+        _outputText.BackColor = Color.FromArgb(250, 250, 250);
+        root.Controls.Add(_outputText, 0, 3);
+
+        var statusStrip = new StatusStrip();
+        statusStrip.Items.Add(_statusLabel);
+        statusStrip.Items.Add(new ToolStripStatusLabel { Spring = true });
+        _remoteStatusLabel.Text = "远端：未检查";
+        _remoteStatusLabel.IsLink = true;
+        _remoteStatusLabel.Click += async (_, _) => await CheckRemoteChangesAsync(showUpToDateMessage: true);
+        statusStrip.Items.Add(_remoteStatusLabel);
+        _statusLabel.Text = "就绪";
+        Controls.Add(statusStrip);
+        _remoteCheckTimer.Interval = 180000;
+        _remoteCheckTimer.Tick += async (_, _) => await CheckRemoteChangesAsync(showUpToDateMessage: false);
+        ApplyControlStyle(this);
+    }
+
+    private static Control CreateTitledPanel(string title, Control content)
+    {
+        var panel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            BackColor = Color.White,
+        };
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        panel.Controls.Add(new Label
+        {
+            Text = title,
+            Dock = DockStyle.Fill,
+            Padding = new Padding(8, 0, 0, 0),
+            TextAlign = ContentAlignment.MiddleLeft,
+            BackColor = Color.FromArgb(241, 243, 245),
+            ForeColor = Color.FromArgb(55, 65, 81),
+            Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+        }, 0, 0);
+        panel.Controls.Add(content, 0, 1);
+        return panel;
+    }
+
+    private void ConfigureTreeImages()
+    {
+        _treeImages.ColorDepth = ColorDepth.Depth32Bit;
+        _treeImages.ImageSize = new Size(16, 16);
+        _treeImages.Images.Clear();
+        _treeImages.Images.Add("repo", CreateTreeIcon(Color.FromArgb(57, 99, 157), false));
+        _treeImages.Images.Add("folder", CreateTreeIcon(Color.FromArgb(219, 164, 64), true));
+        _treeImages.Images.Add("file", CreateTreeIcon(Color.FromArgb(118, 128, 140), false));
+        _treeImages.Images.Add("xml", CreateTreeIcon(Color.FromArgb(39, 132, 85), false));
+        _treeImages.Images.Add("lua", CreateTreeIcon(Color.FromArgb(72, 99, 180), false));
+        _treeImages.Images.Add("changed", CreateTreeIcon(Color.FromArgb(209, 92, 56), false));
+    }
+
+    private static void ConfigureNavigationTree(TreeView tree)
+    {
+        tree.HideSelection = false;
+        tree.FullRowSelect = true;
+        tree.ShowLines = false;
+        tree.ShowRootLines = false;
+        tree.ShowPlusMinus = true;
+        tree.HotTracking = true;
+        tree.ItemHeight = 24;
+        tree.BorderStyle = System.Windows.Forms.BorderStyle.None;
+        tree.BackColor = Color.White;
+        tree.ForeColor = Color.FromArgb(35, 43, 51);
+        tree.LineColor = Color.FromArgb(226, 232, 240);
+    }
+
+    private static Bitmap CreateTreeIcon(Color color, bool folder)
+    {
+        var bitmap = new Bitmap(16, 16);
+        using var graphics = Graphics.FromImage(bitmap);
+        graphics.Clear(Color.Transparent);
+        using var brush = new SolidBrush(color);
+        using var pen = new Pen(ControlPaint.Dark(color), 1);
+        if (folder)
+        {
+            graphics.FillRectangle(brush, 2, 5, 12, 8);
+            graphics.FillRectangle(brush, 3, 3, 5, 3);
+            graphics.DrawRectangle(pen, 2, 5, 12, 8);
+        }
+        else
+        {
+            graphics.FillRectangle(brush, 4, 2, 8, 12);
+            graphics.DrawRectangle(pen, 4, 2, 8, 12);
+            graphics.DrawLine(Pens.White, 6, 5, 10, 5);
+            graphics.DrawLine(Pens.White, 6, 8, 10, 8);
+        }
+
+        return bitmap;
+    }
+
+    private void BuildMoreActionsMenu()
+    {
+        _moreActionsMenu.Items.Clear();
+        _moreActionsMenu.Items.Add("查看改动", null, async (_, _) => await RefreshStatusAsync());
+        _moreActionsMenu.Items.Add("查看差异", null, async (_, _) => await RunDiffAsync());
+        _moreActionsMenu.Items.Add("外部对比/合并", null, async (_, _) => await RunExternalCompareOrMergeAsync());
+        _moreActionsMenu.Items.Add("冲突处理", null, async (_, _) => await RunConflictWorkflowAsync());
+        _moreActionsMenu.Items.Add("文件历史", null, async (_, _) => await RunFileHistoryAsync());
+        _moreActionsMenu.Items.Add(new ToolStripSeparator());
+        _moreActionsMenu.Items.Add("全部文件：刷新", null, (_, _) => LoadAllFiles());
+        _moreActionsMenu.Items.Add("打开操作日志", null, (_, _) => OpenOperationLog());
+    }
+
+    private void OpenOperationLog()
+    {
+        var logPath = OperationLogger.EnsureLogFile();
+        Process.Start(new ProcessStartInfo(logPath) { UseShellExecute = true });
+    }
+
+    private Control CreateStatusPanel()
+    {
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            Padding = new Padding(8),
+            BackColor = Color.White,
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.Controls.Add(CreateStatusToolbar(), 0, 0);
+        root.Controls.Add(_changesList, 0, 1);
+        return root;
+    }
+
+    private Control CreateStatusToolbar()
+    {
+        var panel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 4,
+            RowCount = 1,
+            BackColor = Color.FromArgb(241, 243, 245),
+        };
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 86));
+        panel.Controls.Add(new Label
+        {
+            Text = "本地改动",
+            Dock = DockStyle.Fill,
+            Padding = new Padding(8, 0, 0, 0),
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = Color.FromArgb(55, 65, 81),
+            Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+        }, 0, 0);
+        panel.Controls.Add(CreateSmallToolbarButton("刷新改动", async () => await RefreshStatusAsync()), 1, 0);
+        panel.Controls.Add(CreateSmallToolbarButton("全选", () => SetAllChecks(true)), 2, 0);
+        panel.Controls.Add(CreateSmallToolbarButton("全不选", () => SetAllChecks(false)), 3, 0);
+        return panel;
+    }
+
+    private Control CreateHistoryTopPanel(Control content)
+    {
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            BackColor = Color.White,
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.Controls.Add(CreatePanelToolbar("提交历史", "刷新历史", async () => await LoadRepositoryHistoryAsync()), 0, 0);
+        root.Controls.Add(content, 0, 1);
+        return root;
+    }
+
+    private Control CreateAllFilesPanel()
+    {
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            Padding = new Padding(8),
+            BackColor = Color.White,
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        var toolbar = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 5,
+            RowCount = 1,
+            BackColor = Color.FromArgb(241, 243, 245),
+        };
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
+
+        _fileTreeSearchText.Dock = DockStyle.Fill;
+        _fileTreeSearchText.PlaceholderText = "搜索文件名 / 路径";
+        _fileTreeSearchText.Margin = new Padding(0, 3, 8, 3);
+        _fileTreeSearchText.TextChanged += (_, _) => LoadAllFiles();
+        toolbar.Controls.Add(_fileTreeSearchText, 0, 0);
+
+        _fileTreeChangedOnlyCheck.Text = "仅改动";
+        _fileTreeChangedOnlyCheck.Dock = DockStyle.Fill;
+        _fileTreeChangedOnlyCheck.TextAlign = ContentAlignment.MiddleCenter;
+        _fileTreeChangedOnlyCheck.CheckedChanged += (_, _) => LoadAllFiles();
+        toolbar.Controls.Add(_fileTreeChangedOnlyCheck, 1, 0);
+
+        _fileTreeExpandButton.Text = "展开";
+        _fileTreeExpandButton.Dock = DockStyle.Fill;
+        _fileTreeExpandButton.Margin = new Padding(0, 3, 6, 3);
+        _fileTreeExpandButton.Click += (_, _) => _fileTree.ExpandAll();
+        toolbar.Controls.Add(_fileTreeExpandButton, 2, 0);
+
+        _fileTreeCollapseButton.Text = "折叠";
+        _fileTreeCollapseButton.Dock = DockStyle.Fill;
+        _fileTreeCollapseButton.Margin = new Padding(0, 3, 6, 3);
+        _fileTreeCollapseButton.Click += (_, _) => CollapseFileTreeToRoot();
+        toolbar.Controls.Add(_fileTreeCollapseButton, 3, 0);
+
+        _fileTreeRefreshButton.Text = "刷新";
+        _fileTreeRefreshButton.Dock = DockStyle.Fill;
+        _fileTreeRefreshButton.Margin = new Padding(0, 3, 6, 3);
+        _fileTreeRefreshButton.Click += (_, _) => LoadAllFiles();
+        toolbar.Controls.Add(_fileTreeRefreshButton, 4, 0);
+
+        root.Controls.Add(toolbar, 0, 0);
+        root.Controls.Add(_fileTree, 0, 1);
+        return root;
+    }
+
+    private static Button CreateSmallToolbarButton(string text, Action action)
+    {
+        var button = CreateToolbarButtonBase(text);
+        button.Click += (_, _) => action();
+        return button;
+    }
+
+    private static Button CreateSmallToolbarButton(string text, Func<Task> action)
+    {
+        var button = CreateToolbarButtonBase(text);
+        button.Click += async (_, _) => await action();
+        return button;
+    }
+
+    private static Button CreateToolbarButtonBase(string text)
+    {
+        return new Button
+        {
+            Text = text,
+            Dock = DockStyle.Fill,
+            Margin = new Padding(0, 3, 6, 3),
+        };
+    }
+
+    private static Control CreatePanelToolbar(string title, string buttonText, Func<Task> refresh)
+    {
+        var panel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            BackColor = Color.FromArgb(241, 243, 245),
+        };
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
+        panel.Controls.Add(new Label
+        {
+            Text = title,
+            Dock = DockStyle.Fill,
+            Padding = new Padding(8, 0, 0, 0),
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = Color.FromArgb(55, 65, 81),
+            Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+        }, 0, 0);
+        var button = CreateSmallToolbarButton(buttonText, refresh);
+        panel.Controls.Add(button, 1, 0);
+        return panel;
+    }
+
+    private Control CreateConflictPanel()
+    {
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 3,
+            Padding = new Padding(8),
+            BackColor = Color.White,
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.Controls.Add(CreatePanelToolbar("冲突文件", "刷新冲突", async () => await RefreshStatusAsync()), 0, 0);
+
+        _conflictSummaryLabel.Dock = DockStyle.Fill;
+        _conflictSummaryLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _conflictSummaryLabel.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+        _conflictSummaryLabel.Text = "当前没有读取冲突状态。";
+        root.Controls.Add(_conflictSummaryLabel, 0, 1);
+
+        _conflictGrid.Dock = DockStyle.Fill;
+        _conflictGrid.AllowUserToAddRows = false;
+        _conflictGrid.AllowUserToDeleteRows = false;
+        _conflictGrid.AutoGenerateColumns = false;
+        _conflictGrid.ReadOnly = true;
+        _conflictGrid.RowHeadersVisible = false;
+        _conflictGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+        _conflictGrid.MultiSelect = false;
+        _conflictGrid.BackgroundColor = Color.White;
+        _conflictGrid.CellContentClick += async (_, args) => await HandleConflictGridClickAsync(args);
+        _conflictGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "冲突文件", DataPropertyName = nameof(ConflictGridRow.RelativePath), Width = 620 });
+        _conflictGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "说明", DataPropertyName = nameof(ConflictGridRow.Description), Width = 220 });
+        _conflictGrid.Columns.Add(new DataGridViewButtonColumn { HeaderText = "打开合并", Name = "OpenMerge", Text = "打开合并", UseColumnTextForButtonValue = true, Width = 110 });
+        _conflictGrid.Columns.Add(new DataGridViewButtonColumn { HeaderText = "打开目录", Name = "OpenFolder", Text = "打开目录", UseColumnTextForButtonValue = true, Width = 110 });
+        _conflictGrid.Columns.Add(new DataGridViewButtonColumn { HeaderText = "标记解决", Name = "Resolve", Text = "标记解决", UseColumnTextForButtonValue = true, Width = 110 });
+        root.Controls.Add(_conflictGrid, 0, 2);
+        return root;
+    }
+
+    private static void ApplyControlStyle(Control root)
+    {
+        foreach (Control control in root.Controls)
+        {
+            if (control is Button button)
+            {
+                button.Height = 28;
+                button.FlatStyle = FlatStyle.Flat;
+                button.FlatAppearance.BorderColor = Color.FromArgb(180, 186, 194);
+                button.BackColor = Color.FromArgb(248, 249, 250);
+                button.ForeColor = Color.FromArgb(20, 31, 43);
+            }
+            else if (control is TabControl tabControl)
+            {
+                tabControl.BackColor = Color.White;
+            }
+
+            ApplyControlStyle(control);
+        }
+    }
+
+    private void RestoreUiLayout()
+    {
+        var layout = _settings.UiLayout;
+        if (layout.WindowWidth >= MinimumSize.Width && layout.WindowHeight >= MinimumSize.Height)
+        {
+            var bounds = new Rectangle(layout.WindowX, layout.WindowY, layout.WindowWidth, layout.WindowHeight);
+            if (IsVisibleOnAnyScreen(bounds))
+            {
+                StartPosition = FormStartPosition.Manual;
+                Bounds = bounds;
+            }
+        }
+
+        SafeSetSplitterDistance(_workspaceSplit, layout.WorkspaceSplitterDistance);
+        var historyDistance = layout.HistorySplitterDistance <= 0 ? 240 : Math.Min(layout.HistorySplitterDistance, 260);
+        SafeSetSplitterDistance(_historySplit, historyDistance);
+        SafeSetSplitterDistance(_changedFilesSplit, layout.ChangedFilesSplitterDistance);
+
+        if (layout.IsMaximized)
+        {
+            WindowState = FormWindowState.Maximized;
+        }
+    }
+
+    private void SaveUiLayout()
+    {
+        var bounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+        _settings.UiLayout.WindowX = bounds.X;
+        _settings.UiLayout.WindowY = bounds.Y;
+        _settings.UiLayout.WindowWidth = bounds.Width;
+        _settings.UiLayout.WindowHeight = bounds.Height;
+        _settings.UiLayout.IsMaximized = WindowState == FormWindowState.Maximized;
+        _settings.UiLayout.WorkspaceSplitterDistance = _workspaceSplit.SplitterDistance;
+        _settings.UiLayout.HistorySplitterDistance = _historySplit.SplitterDistance;
+        _settings.UiLayout.ChangedFilesSplitterDistance = _changedFilesSplit.SplitterDistance;
+        _settings.UiLayout.SelectedTab = GetBaseTabText(_mainTabs.SelectedTab?.Text ?? "History");
+        _settings.Save();
+    }
+
+    private static void SafeSetSplitterDistance(SplitContainer split, int distance)
+    {
+        if (distance <= 0 || split.Width <= 0 || split.Height <= 0)
+        {
+            return;
+        }
+
+        var available = split.Orientation == Orientation.Vertical ? split.Width : split.Height;
+        var max = available - split.SplitterWidth - split.Panel2MinSize;
+        var min = split.Panel1MinSize;
+        if (max <= min)
+        {
+            return;
+        }
+
+        split.SplitterDistance = Math.Max(min, Math.Min(distance, max));
+    }
+
+    private static bool IsVisibleOnAnyScreen(Rectangle bounds)
+    {
+        return Screen.AllScreens.Any(screen => screen.WorkingArea.IntersectsWith(bounds));
+    }
+
+    private void LoadSettingsIntoUi()
+    {
+        _settings.MigrateLegacySettings();
+        _settings.AddKnownWorkingCopyIfExists(
+            "DG_lua trunk",
+            "svn://192.168.6.20:13690/xdqd_xml/trunk",
+            @"C:\Users\Administrator\Desktop\DG_lua\trunk");
+        RefreshRepositorySelector();
+        var selected = _settings.GetCurrentRepository();
+        _repoUrlText.Text = selected?.RepositoryUrl ?? "svn://192.168.6.20:13690/xdqd_xml/trunk";
+        _workingCopyText.Text = selected?.WorkingCopyPath ?? "";
+        LoadAllFiles();
+        SelectTab(string.IsNullOrWhiteSpace(_settings.UiLayout.SelectedTab) ? "History" : _settings.UiLayout.SelectedTab);
+    }
+
+    private async Task RunCheckoutAsync()
+    {
+        if (!ValidateRepositoryUrl() || !ValidateWorkingCopyPath(allowMissing: true))
+        {
+            return;
+        }
+
+        var workingCopy = _workingCopyText.Text.Trim();
+        if (Directory.Exists(workingCopy) && Directory.EnumerateFileSystemEntries(workingCopy).Any())
+        {
+            if (Directory.Exists(Path.Combine(workingCopy, ".svn")))
+            {
+                SaveCurrentRepository();
+                WriteOutput($"已保存已有 SVN 工作副本：{workingCopy}");
+                await RefreshStatusAsync();
+                return;
+            }
+
+            MessageBox.Show("本地目录不是空目录。为了避免覆盖已有文件，请选择一个空目录或已有 SVN 工作副本。", "无法检出", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        await RunSvnOperationAsync("正在检出...", async () =>
+        {
+            Directory.CreateDirectory(workingCopy);
+            var result = await _svn.CheckoutAsync(_repoUrlText.Text.Trim(), workingCopy);
+            SaveCurrentRepository();
+            return result;
+        });
+        await RefreshStatusAsync();
+    }
+
+    private async Task RunUpdateAsync()
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        var workingCopy = _workingCopyText.Text.Trim();
+        var preflightChanges = await _svn.GetStatusAsync(workingCopy);
+        if (!ConfirmUpdateWithLocalChanges(preflightChanges))
+        {
+            OperationLogger.Log("UpdateCancelled", workingCopy, $"localChanges={preflightChanges.Count}");
+            WriteOutput("已取消拉取最新：当前有未提交改动。");
+            return;
+        }
+
+        OperationLogger.Log("UpdateStart", workingCopy, $"localChanges={preflightChanges.Count}");
+        await RunSvnOperationAsync("正在拉取最新...", async () =>
+        {
+            SaveSettings();
+            return await _svn.UpdateAsync(workingCopy);
+        });
+        OperationLogger.Log("UpdateFinish", workingCopy, "svn update finished");
+        await RefreshStatusAsync();
+        await CheckRemoteChangesAsync(showUpToDateMessage: false);
+    }
+
+    private bool ConfirmUpdateWithLocalChanges(IReadOnlyList<SvnChange> changes)
+    {
+        if (changes.Count == 0)
+        {
+            return true;
+        }
+
+        var conflicts = changes.Count(change => change.Status == SvnStatusKind.Conflicted);
+        var unversioned = changes.Count(change => change.Status == SvnStatusKind.Unversioned);
+        var message =
+            $"当前有 {changes.Count} 个未提交改动。直接拉取最新可能产生冲突。{Environment.NewLine}{Environment.NewLine}" +
+            $"冲突：{conflicts} 个{Environment.NewLine}" +
+            $"未加入版本控制：{unversioned} 个{Environment.NewLine}{Environment.NewLine}" +
+            "建议先查看改动、提交或备份，再拉取最新。仍然继续拉取？";
+        var result = MessageBox.Show(
+            message,
+            "拉取最新前确认",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2);
+        return result == DialogResult.OK;
+    }
+
+    private async Task RefreshStatusAsync()
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        ClearHistoryDiffPreviewCache();
+        SetBusy(true, "正在查看改动...");
+        try
+        {
+            SaveSettings();
+            var changes = await _svn.GetStatusAsync(_workingCopyText.Text.Trim());
+            _changesList.BeginUpdate();
+            _changesList.Items.Clear();
+            foreach (var change in changes)
+            {
+                var item = new ListViewItem(change.DisplayStatus) { Tag = change, Checked = change.CanCommit };
+                item.SubItems.Add(change.RelativePath);
+                item.SubItems.Add(change.Description);
+                if (change.Status == SvnStatusKind.Conflicted)
+                {
+                    item.ForeColor = Color.DarkRed;
+                    item.Checked = false;
+                }
+                _changesList.Items.Add(item);
+            }
+            _changesList.EndUpdate();
+            var conflicts = changes.Where(change => change.Status == SvnStatusKind.Conflicted).ToList();
+            RefreshConflictPanel(conflicts);
+            UpdateStatusBadges(changes.Count, conflicts.Count);
+            if (conflicts.Count > 0)
+            {
+                WriteOutput(
+                    $"发现 {changes.Count} 个本地改动，其中 {conflicts.Count} 个冲突。\r\n\r\n" +
+                    "SVN 冲突会在目录里生成 .mine、.r旧版本、.r新版本 文件，这是正常现象。" +
+                    "请先处理冲突，再提交。冲突文件已经在列表里标红。");
+            }
+            else
+            {
+                WriteOutput(changes.Count == 0 ? "没有本地改动。" : $"发现 {changes.Count} 个本地改动。");
+            }
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private void RefreshConflictPanel(IReadOnlyList<SvnChange> conflicts)
+    {
+        _currentConflicts = conflicts.OrderBy(change => change.RelativePath).ToList();
+        _conflictSummaryLabel.Text = _currentConflicts.Count == 0
+            ? "当前没有冲突文件。"
+            : $"当前有 {_currentConflicts.Count} 个冲突文件。请逐个打开合并，确认保存后再标记解决。";
+        _conflictSummaryLabel.ForeColor = _currentConflicts.Count == 0 ? Color.FromArgb(45, 100, 65) : Color.DarkRed;
+        _conflictGrid.DataSource = _currentConflicts
+            .Select(change => new ConflictGridRow(change.RelativePath, change.Description))
+            .ToList();
+    }
+
+    private void UpdateStatusBadges(int changeCount, int conflictCount)
+    {
+        _statusPage.Text = changeCount > 0 ? $"File Status({changeCount})" : "File Status";
+        _conflictPage.Text = conflictCount > 0 ? $"冲突({conflictCount})" : "冲突";
+    }
+
+    private void UpdateHistoryBadge(int logCount)
+    {
+        _historyPage.Text = logCount > 0 ? $"History({logCount})" : "History";
+    }
+
+    private async Task CheckRemoteChangesAsync(bool showUpToDateMessage)
+    {
+        if (_checkingRemote || !ValidateWorkingCopyPathForBackground())
+        {
+            return;
+        }
+
+        _checkingRemote = true;
+        try
+        {
+            var workingCopy = _workingCopyText.Text.Trim();
+            var latest = await _svn.GetLatestRepositoryLogAsync(workingCopy);
+            if (latest == null)
+            {
+                _remoteStatusLabel.Text = "远端：无历史";
+                _remoteStatusLabel.ForeColor = SystemColors.ControlText;
+                return;
+            }
+
+            var info = _svn.GetWorkingCopyInfo(workingCopy);
+            var hasRemoteUpdates = info.MaxRevision > 0 && latest.Revision > info.MaxRevision;
+            if (hasRemoteUpdates)
+            {
+                _remoteStatusLabel.Text = $"远端有新提交 r{latest.Revision}";
+                _remoteStatusLabel.ForeColor = Color.DarkRed;
+                if (_latestRemoteLog == null || latest.Revision > _latestRemoteLog.Revision)
+                {
+                    WriteOutput($"远端有新提交：r{latest.Revision}  {latest.Author}  {latest.ShortMessage}");
+                }
+            }
+            else
+            {
+                _remoteStatusLabel.Text = $"远端最新 r{latest.Revision}";
+                _remoteStatusLabel.ForeColor = Color.FromArgb(45, 100, 65);
+                if (showUpToDateMessage)
+                {
+                    WriteOutput($"当前没有检测到需要拉取的新提交。远端最新：r{latest.Revision}");
+                }
+            }
+
+            _latestRemoteLog = latest;
+        }
+        catch (Exception ex)
+        {
+            _remoteStatusLabel.Text = "远端：检查失败";
+            _remoteStatusLabel.ForeColor = Color.FromArgb(166, 103, 34);
+            if (showUpToDateMessage)
+            {
+                WriteOutput("远端检查失败：" + ex.Message);
+            }
+        }
+        finally
+        {
+            _checkingRemote = false;
+        }
+    }
+
+    private bool ValidateWorkingCopyPathForBackground()
+    {
+        var path = _workingCopyText.Text.Trim();
+        return Directory.Exists(path) && Directory.Exists(Path.Combine(path, ".svn"));
+    }
+
+    private async Task HandleConflictGridClickAsync(DataGridViewCellEventArgs args)
+    {
+        if (args.RowIndex < 0 ||
+            args.ColumnIndex < 0 ||
+            _conflictGrid.Rows[args.RowIndex].DataBoundItem is not ConflictGridRow row)
+        {
+            return;
+        }
+
+            var columnName = _conflictGrid.Columns[args.ColumnIndex].Name;
+        switch (columnName)
+        {
+            case "OpenMerge":
+                OpenConflictMerge(row.RelativePath);
+                break;
+            case "OpenFolder":
+                OpenConflictFolderByPath(row.RelativePath);
+                break;
+            case "Resolve":
+                await ResolveConflictPathAsync(row.RelativePath);
+                break;
+        }
+    }
+
+    private async Task RunDiffAsync()
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        var relativePath = GetSelectedRelativePath();
+        if (string.IsNullOrWhiteSpace(relativePath))
+        {
+            MessageBox.Show("请先选中一个文件。", "未选择文件", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var extension = GetComparableExtension(relativePath);
+        var selectedChange = GetSelectedChange();
+        if (selectedChange?.Status is SvnStatusKind.Unversioned or SvnStatusKind.Added)
+        {
+            MessageBox.Show("这是新增文件，没有 SVN 基准版本可对比。", "无法对比", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (selectedChange?.Status is SvnStatusKind.Missing or SvnStatusKind.Deleted)
+        {
+            MessageBox.Show("本地文件不存在，暂不支持查看 Excel 差异。", "无法对比", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        SetBusy(true, "正在生成差异...");
+        var tempBaseFile = Path.Combine(Path.GetTempPath(), $"SVNManager_BASE_{Guid.NewGuid():N}{extension}");
+        try
+        {
+            var workingCopy = _workingCopyText.Text.Trim();
+            var localFile = Path.Combine(workingCopy, relativePath);
+            var conflict = ConflictFileSet.Find(workingCopy, relativePath);
+            if (conflict?.ServerPath != null)
+            {
+                ShowDiffWindow($"我的版本 -> 服务器版本：{relativePath}", conflict.MinePath, conflict.ServerPath);
+                return;
+            }
+
+            await _svn.WriteBaseFileAsync(workingCopy, relativePath, tempBaseFile);
+            ShowDiffWindow($"BASE -> 本地：{relativePath}", tempBaseFile, localFile);
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            TryDelete(tempBaseFile);
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private async Task RunConflictViewerAsync()
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        var relativePath = GetSelectedRelativePath();
+        if (string.IsNullOrWhiteSpace(relativePath))
+        {
+            MessageBox.Show("请先选中一个冲突文件。", "未选择文件", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        SetBusy(true, "正在读取冲突版本...");
+        await Task.Yield();
+        try
+        {
+            var workingCopy = _workingCopyText.Text.Trim();
+            var conflict = ConflictFileSet.Find(workingCopy, relativePath);
+            if (conflict == null)
+            {
+                MessageBox.Show("没有找到 .mine / .r版本号 冲突辅助文件。", "不是冲突文件", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            using var form = new ConflictViewerForm(conflict, conflictFile => LaunchExternalConflictCompare(conflictFile));
+            form.ShowDialog(this);
+            WriteOutput($"已打开冲突查看器：{conflict.RelativePath}");
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private async Task RunConflictWorkflowAsync()
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        var relativePath = GetSelectedRelativePath();
+        if (string.IsNullOrWhiteSpace(relativePath))
+        {
+            MessageBox.Show("请先选中一个冲突文件。", "未选择文件", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        SetBusy(true, "正在准备冲突处理...");
+        try
+        {
+            var conflict = FindConflictOrWarn(relativePath);
+            if (conflict == null || !LaunchExternalConflictCompare(conflict))
+            {
+                return;
+            }
+
+            OpenConflictFileFolder(conflict);
+            SetBusy(false, "等待手动合并完成");
+            var confirm = MessageBox.Show(
+                "已经打开分久必合和当前文件目录。\r\n\r\n请在外部工具中完成合并，并把最终结果保存到当前冲突文件后，再点击“确定”。\r\n\r\n确定后会执行 svn resolve，并刷新状态。",
+                "确认合并已保存",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Question);
+            if (confirm != DialogResult.OK)
+            {
+                WriteOutput($"已打开冲突处理工具，尚未标记已解决：{conflict.RelativePath}");
+                return;
+            }
+
+            SetBusy(true, "正在标记冲突已解决...");
+            await ResolveConflictPathCoreAsync(conflict.RelativePath);
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private void OpenConflictMerge(string relativePath)
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        SetBusy(true, "正在打开合并工具...");
+        try
+        {
+            var conflict = FindConflictOrWarn(relativePath);
+            if (conflict != null && LaunchExternalConflictCompare(conflict))
+            {
+                WriteOutput($"已打开合并工具：{conflict.RelativePath}");
+            }
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private void OpenConflictFolderByPath(string relativePath)
+    {
+        var conflict = FindConflictOrWarn(relativePath);
+        if (conflict != null)
+        {
+            OpenConflictFileFolder(conflict);
+            WriteOutput($"已打开冲突文件目录：{conflict.RelativePath}");
+        }
+    }
+
+    private async Task ResolveConflictPathAsync(string relativePath)
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        var conflict = FindConflictOrWarn(relativePath);
+        if (conflict == null)
+        {
+            return;
+        }
+
+        var confirm = MessageBox.Show(
+            $"确认已经把最终合并结果保存到当前文件，并标记冲突已解决？\r\n\r\n{conflict.RelativePath}",
+            "标记冲突已解决",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Question);
+        if (confirm != DialogResult.OK)
+        {
+            return;
+        }
+
+        SetBusy(true, "正在标记冲突已解决...");
+        try
+        {
+            await ResolveConflictPathCoreAsync(conflict.RelativePath);
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private async Task ResolveConflictPathCoreAsync(string relativePath)
+    {
+        var result = await _svn.ResolveAsync(_workingCopyText.Text.Trim(), relativePath);
+        OperationLogger.Log(result.ExitCode == 0 ? "ResolveConflictSuccess" : "ResolveConflictFailed", _workingCopyText.Text.Trim(), relativePath);
+        WriteOutput(result.CombinedOutput);
+        await RefreshStatusAsync();
+        LoadAllFiles();
+        await LoadRepositoryHistoryAsync();
+    }
+
+    private ConflictFileSet? FindConflictOrWarn(string relativePath)
+    {
+        var conflict = ConflictFileSet.Find(_workingCopyText.Text.Trim(), relativePath);
+        if (conflict == null)
+        {
+            MessageBox.Show("没有找到 .mine / .r版本号 冲突辅助文件。请确认选中的是 SVN 冲突文件。", "不是冲突文件", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        return conflict;
+    }
+
+    private async Task RunExternalCompareOrMergeAsync()
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        var relativePath = GetSelectedRelativePath();
+        if (string.IsNullOrWhiteSpace(relativePath))
+        {
+            MessageBox.Show("请先选中一个 XML 表格文件或冲突文件。", "未选择文件", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        SetBusy(true, "正在准备外部对比...");
+        try
+        {
+            var workingCopy = _workingCopyText.Text.Trim();
+            var conflict = ConflictFileSet.Find(workingCopy, relativePath);
+            if (conflict != null)
+            {
+                LaunchExternalConflictCompare(conflict);
+                return;
+            }
+
+            if (!IsExternalTableToolSupported(relativePath))
+            {
+                MessageBox.Show("分久必合当前主要用于 XML / XLSX / CSV 表格。Lua 等文本文件请先使用内置差异查看。", "文件类型不适合", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            var selectedChange = GetSelectedChange();
+            if (selectedChange?.Status is SvnStatusKind.Unversioned or SvnStatusKind.Added)
+            {
+                MessageBox.Show("这是新增文件，没有 SVN 基准版本可对比。", "无法外部对比", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (selectedChange?.Status is SvnStatusKind.Missing or SvnStatusKind.Deleted)
+            {
+                MessageBox.Show("本地文件不存在，无法交给外部工具。", "无法外部对比", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            var localFile = Path.Combine(workingCopy, relativePath);
+            if (!File.Exists(localFile))
+            {
+                MessageBox.Show("本地没有找到这个文件。", "无法外部对比", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            var baseFile = CreateExternalTempPath("BASE", relativePath);
+            await _svn.WriteBaseFileAsync(workingCopy, relativePath, baseFile);
+            if (LaunchExternalMergeTool(baseFile, localFile))
+            {
+                WriteOutput($"已打开分久必合：BASE -> 本地：{relativePath}");
+            }
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private async Task RunSelectedHistoryChangedFileExternalCompareAsync()
+    {
+        if (!ValidateWorkingCopyPath() ||
+            _historyChangedFilesTree.SelectedNode?.Tag is not ChangedFileEntry file ||
+            (_selectedHistoryLog == null && _selectedHistoryLogs.Count <= 1))
+        {
+            return;
+        }
+
+        if (!IsExternalTableToolSupported(file.TreePath))
+        {
+            MessageBox.Show("分久必合当前主要用于 XML / XLSX / CSV 表格。Lua 等文本文件请先使用内置差异预览。", "文件类型不适合", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        SetBusy(true, "正在准备外部对比...");
+        try
+        {
+            if (_selectedHistoryLog?.IsUncommitted == true && file.Action == "C")
+            {
+                var conflict = ConflictFileSet.Find(_workingCopyText.Text.Trim(), file.RelativePath);
+                if (conflict != null)
+                {
+                    LaunchExternalConflictCompare(conflict);
+                    return;
+                }
+            }
+
+            var oldTemp = CreateExternalTempPath("OLD", file.TreePath);
+            var newTemp = CreateExternalTempPath("NEW", file.TreePath);
+            var workingCopy = _workingCopyText.Text.Trim();
+            if (_selectedHistoryLogs.Count > 1)
+            {
+                var committedLogs = _selectedHistoryLogs.Where(log => !log.IsUncommitted).OrderBy(log => log.Revision).ToList();
+                if (committedLogs.Count == 0)
+                {
+                    MessageBox.Show("多选范围不支持只选择未提交改动。", "无法外部对比", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                await PrepareRangeDiffFilesAsync(_svn, workingCopy, committedLogs.First().Revision, committedLogs.Last().Revision, file, oldTemp, newTemp);
+            }
+            else if (_selectedHistoryLog?.IsUncommitted == true)
+            {
+                await PrepareUncommittedDiffFilesAsync(workingCopy, file, oldTemp, newTemp);
+            }
+            else if (_selectedHistoryLog != null)
+            {
+                await PrepareCommittedDiffFilesAsync(_svn, workingCopy, _selectedHistoryLog.Revision, file, oldTemp, newTemp);
+            }
+
+            if (LaunchExternalMergeTool(oldTemp, newTemp))
+            {
+                WriteOutput($"已打开分久必合：{file.DisplayText}");
+            }
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private bool LaunchExternalConflictCompare(ConflictFileSet conflict)
+    {
+        if (conflict.ServerPath == null)
+        {
+            MessageBox.Show("没有找到服务器版本文件，无法外部对比。", "无法外部对比", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
+
+        if (!IsExternalTableToolSupported(conflict.RelativePath))
+        {
+            MessageBox.Show("分久必合当前主要用于 XML / XLSX / CSV 表格。", "文件类型不适合", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
+
+        var mineFile = CopyToExternalTempFile(conflict.MinePath, "MINE", conflict.RelativePath);
+        var serverFile = CopyToExternalTempFile(conflict.ServerPath, "SERVER", conflict.RelativePath);
+        if (LaunchExternalMergeTool(mineFile, serverFile))
+        {
+            WriteOutput($"已打开分久必合：我的版本 -> 服务器版本：{conflict.RelativePath}");
+            return true;
+        }
+
+        return false;
+    }
+
+    private static void OpenConflictFileFolder(ConflictFileSet conflict)
+    {
+        var argument = File.Exists(conflict.CurrentPath)
+            ? $"/select,\"{conflict.CurrentPath}\""
+            : Path.GetDirectoryName(conflict.CurrentPath);
+        if (!string.IsNullOrWhiteSpace(argument))
+        {
+            Process.Start(new ProcessStartInfo("explorer.exe", argument) { UseShellExecute = true });
+        }
+    }
+
+    private bool LaunchExternalMergeTool(params string[] filePaths)
+    {
+        var toolPath = ResolveExternalMergeToolPath();
+        if (string.IsNullOrWhiteSpace(toolPath))
+        {
+            MessageBox.Show("没有找到分久必合.exe。请确认新XML表格合并工具已经打包，或在弹出的窗口中选择 exe。", "外部工具未找到", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+
+        var startInfo = new ProcessStartInfo(toolPath)
+        {
+            UseShellExecute = false,
+            WorkingDirectory = Path.GetDirectoryName(toolPath) ?? Environment.CurrentDirectory,
+        };
+        foreach (var filePath in filePaths.Where(File.Exists))
+        {
+            startInfo.ArgumentList.Add(filePath);
+        }
+
+        Process.Start(startInfo);
+        OperationLogger.Log("OpenExternalMergeTool", _workingCopyText.Text.Trim(), string.Join(" | ", filePaths));
+        return true;
+    }
+
+    private string? ResolveExternalMergeToolPath()
+    {
+        var bundledCandidates = new[]
+        {
+            Path.Combine(AppContext.BaseDirectory, "ExternalTools", "分久必合", "分久必合.exe"),
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "ExternalTools", "分久必合", "分久必合.exe"),
+            Path.Combine(AppContext.BaseDirectory, "新XML表格合并工具", "dist", "分久必合", "分久必合.exe"),
+        };
+
+        var toolPath = bundledCandidates
+            .Select(path => Path.GetFullPath(path))
+            .FirstOrDefault(File.Exists);
+        if (toolPath != null)
+        {
+            _settings.ExternalMergeToolPath = toolPath;
+            _settings.Save();
+            return toolPath;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_settings.ExternalMergeToolPath) && File.Exists(_settings.ExternalMergeToolPath))
+        {
+            return _settings.ExternalMergeToolPath;
+        }
+
+        if (toolPath == null)
+        {
+            toolPath = FindSiblingExternalMergeTool();
+        }
+
+        if (toolPath != null)
+        {
+            _settings.ExternalMergeToolPath = toolPath;
+            _settings.Save();
+            return toolPath;
+        }
+
+        using var dialog = new OpenFileDialog
+        {
+            Title = "选择分久必合.exe",
+            Filter = "分久必合.exe|*.exe|所有文件|*.*",
+            CheckFileExists = true,
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return null;
+        }
+
+        _settings.ExternalMergeToolPath = dialog.FileName;
+        _settings.Save();
+        return dialog.FileName;
+    }
+
+    private static string? FindSiblingExternalMergeTool()
+    {
+        var current = new DirectoryInfo(AppContext.BaseDirectory);
+        while (current != null)
+        {
+            var candidate = Path.Combine(current.FullName, "新XML表格合并工具", "dist", "分久必合", "分久必合.exe");
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+
+            current = current.Parent;
+        }
+
+        return null;
+    }
+
+    private static bool IsExternalTableToolSupported(string path)
+    {
+        var extension = GetComparableExtension(path);
+        return extension.Equals(".xml", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".xlsx", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".csv", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string CopyToExternalTempFile(string sourcePath, string label, string relativePath)
+    {
+        var targetPath = CreateExternalTempPath(label, relativePath);
+        File.Copy(sourcePath, targetPath, true);
+        return targetPath;
+    }
+
+    private static string CreateExternalTempPath(string label, string relativePath)
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "SVNManager", "ExternalCompare", DateTime.Now.ToString("yyyyMMdd_HHmmss_fff"));
+        Directory.CreateDirectory(directory);
+        var comparablePath = SvnConflictArtifact.NormalizeToBasePath(relativePath);
+        var extension = GetComparableExtension(relativePath);
+        var fileName = Path.GetFileNameWithoutExtension(comparablePath);
+        if (string.IsNullOrWhiteSpace(fileName))
+        {
+            fileName = "file";
+        }
+
+        return Path.Combine(directory, $"{SanitizeFileName(label)}_{SanitizeFileName(fileName)}{extension}");
+    }
+
+    private static string CreateHistoryOpenTempPath(string label, string relativePath)
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "SVNManager", "HistoryOpen", DateTime.Now.ToString("yyyyMMdd_HHmmss_fff"));
+        Directory.CreateDirectory(directory);
+        var comparablePath = SvnConflictArtifact.NormalizeToBasePath(relativePath);
+        var extension = GetComparableExtension(relativePath);
+        var fileName = Path.GetFileNameWithoutExtension(comparablePath);
+        if (string.IsNullOrWhiteSpace(fileName))
+        {
+            fileName = "file";
+        }
+
+        return Path.Combine(directory, $"{SanitizeFileName(fileName)}_{SanitizeFileName(label)}{extension}");
+    }
+
+    private static string FormatPathListLabel(IReadOnlyList<string> relativePaths)
+    {
+        if (relativePaths.Count == 0)
+        {
+            return "";
+        }
+
+        if (relativePaths.Count == 1)
+        {
+            return relativePaths[0];
+        }
+
+        return $"{relativePaths.Count} 个路径：" + string.Join("、", relativePaths.Take(3)) + (relativePaths.Count > 3 ? "..." : "");
+    }
+
+    private static string SanitizeFileName(string value)
+    {
+        var invalid = Path.GetInvalidFileNameChars();
+        var builder = new StringBuilder(value.Length);
+        foreach (var character in value)
+        {
+            builder.Append(invalid.Contains(character) ? '_' : character);
+        }
+
+        return builder.ToString();
+    }
+
+    private static string GetComparableExtension(string path)
+    {
+        return Path.GetExtension(SvnConflictArtifact.NormalizeToBasePath(path));
+    }
+
+    private static bool IsUnsafeCommitPath(string path)
+    {
+        var fileName = Path.GetFileName(path);
+        var extension = Path.GetExtension(path);
+        return SvnConflictArtifact.IsAuxiliaryPath(path) ||
+            fileName.EndsWith("~", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".tmp", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".temp", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".bak", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".orig", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string CommitBlockReason(SvnChange change)
+    {
+        if (IsUnsafeCommitPath(change.RelativePath))
+        {
+            return "SVN 冲突辅助文件、临时文件或备份文件，禁止提交";
+        }
+
+        return change.Status switch
+        {
+            SvnStatusKind.Conflicted => "文件仍有冲突，请先打开合并并标记解决",
+            SvnStatusKind.Missing => "文件在本地缺失，暂不自动提交删除",
+            _ => "",
+        };
+    }
+
+    private void ShowDiffWindow(string title, string oldFilePath, string newFilePath)
+    {
+        if (DiffFileKindDetector.IsSpreadsheet(oldFilePath) && DiffFileKindDetector.IsSpreadsheet(newFilePath))
+        {
+            var differences = ExcelDiffService.Compare(oldFilePath, newFilePath);
+            using var form = new ExcelDiffForm(title, differences);
+            form.ShowDialog(this);
+            WriteOutput(differences.Count == 0 ? $"没有发现单元格差异：{title}" : $"发现 {differences.Count} 个单元格差异：{title}");
+            return;
+        }
+
+        var lineDiffs = TextDiffService.Compare(oldFilePath, newFilePath);
+        using var textForm = new TextDiffForm(title, lineDiffs);
+        textForm.ShowDialog(this);
+        WriteOutput(lineDiffs.Count == 0 ? $"没有发现文本差异：{title}" : $"发现 {lineDiffs.Count} 行文本差异：{title}");
+    }
+
+    private async Task RunFileHistoryAsync()
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        var relativePaths = GetSelectedFileTreeHistoryPaths();
+        if (relativePaths.Count == 0)
+        {
+            MessageBox.Show("请先选中或勾选一个文件/文件夹，再查看历史。", "未选择路径", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        SetBusy(true, "正在读取文件历史...");
+        try
+        {
+            await ShowFileHistoryWindowAsync(relativePaths);
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private async Task ShowFileHistoryWindowAsync(string relativePath)
+    {
+        await ShowFileHistoryWindowAsync([relativePath]);
+    }
+
+    private async Task ShowFileHistoryWindowAsync(IReadOnlyList<string> relativePaths)
+    {
+        var workingCopy = _workingCopyText.Text.Trim();
+        var logs = await _svn.GetLogAsync(workingCopy, relativePaths, 80);
+        using var form = new FileHistoryForm(workingCopy, relativePaths, logs, _svn);
+        form.ShowDialog(this);
+        var label = FormatPathListLabel(relativePaths);
+        WriteOutput(logs.Count == 0
+            ? $"没有读取到历史：{label}"
+            : $"已打开历史窗口：{label}（{logs.Count} 条）");
+    }
+
+    private async Task LoadRepositoryHistoryAsync()
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        ClearHistoryDiffPreviewCache();
+        SetBusy(true, "正在读取仓库历史...");
+        try
+        {
+            var logs = await _svn.GetRepositoryLogAsync(_workingCopyText.Text.Trim(), 80);
+            _latestRemoteLog = logs.FirstOrDefault(log => !log.IsUncommitted);
+            FillHistoryList(logs);
+            UpdateHistoryBadge(logs.Count);
+            WriteOutput(logs.Count == 0 ? "没有读取到仓库历史。" : $"已读取 {logs.Count} 条仓库历史。");
+            await CheckRemoteChangesAsync(showUpToDateMessage: false);
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private async Task RunCommitAsync()
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        var selectedPaths = _changesList.CheckedItems
+            .Cast<ListViewItem>()
+            .Select(item => ((SvnChange)item.Tag!).RelativePath)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (selectedPaths.Count == 0)
+        {
+            MessageBox.Show("请先勾选要提交的文件。", "没有选择文件", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        var workingCopy = _workingCopyText.Text.Trim();
+        var latestChanges = (await _svn.GetStatusAsync(workingCopy)).ToList();
+        var conflicts = latestChanges.Where(change => change.Status == SvnStatusKind.Conflicted).ToList();
+        string? globalBlockReason = null;
+        if (conflicts.Count > 0)
+        {
+            RefreshConflictPanel(conflicts);
+            globalBlockReason = $"当前工作副本仍有 {conflicts.Count} 个冲突。请先在“冲突”页处理完，再提交。";
+        }
+
+        var latestMap = latestChanges.ToDictionary(change => NormalizeRelativePath(change.RelativePath), StringComparer.OrdinalIgnoreCase);
+        var selectedChanges = selectedPaths
+            .Select(path => latestMap.TryGetValue(NormalizeRelativePath(path), out var change) ? change : null)
+            .Where(change => change != null)
+            .Cast<SvnChange>()
+            .ToList();
+
+        if (selectedChanges.Count == 0)
+        {
+            MessageBox.Show("勾选的文件当前没有可提交改动，请先刷新状态。", "没有可提交改动", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            await RefreshStatusAsync();
+            return;
+        }
+
+        var message = "";
+        using (var preview = new CommitPreviewForm(_settings.LastCommitMessage, selectedChanges, CommitBlockReason, globalBlockReason))
+        {
+            if (preview.ShowDialog(this) != DialogResult.OK)
+            {
+                return;
+            }
+
+            message = preview.CommitMessage;
+            selectedChanges = preview.SelectedChanges.ToList();
+        }
+
+        if (selectedChanges.Count == 0)
+        {
+            MessageBox.Show("请至少保留一个要提交的文件。", "没有提交文件", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (message.Length < 4)
+        {
+            var continueShortMessage = MessageBox.Show(
+                "提交说明比较短，可能不方便之后查历史。\r\n\r\n仍然继续提交？",
+                "提交说明偏短",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Question);
+            if (continueShortMessage != DialogResult.OK)
+            {
+                return;
+            }
+        }
+
+        var result = await RunSvnOperationAsync("正在提交...", async () =>
+        {
+            var unversioned = selectedChanges.Where(change => change.Status == SvnStatusKind.Unversioned).ToList();
+            var output = "";
+            foreach (var change in unversioned)
+            {
+                var addResult = await _svn.AddAsync(workingCopy, change.RelativePath);
+                output += addResult.CombinedOutput + Environment.NewLine;
+            }
+
+            var commitResult = await _svn.CommitAsync(workingCopy, selectedChanges.Select(change => change.RelativePath), message);
+            _settings.LastCommitMessage = message;
+            SaveSettings();
+            return new ProcessResult(commitResult.ExitCode, output + commitResult.StandardOutput, commitResult.StandardError);
+        });
+        OperationLogger.Log(
+            result?.ExitCode == 0 ? "CommitSuccess" : "CommitFailed",
+            workingCopy,
+            $"files={selectedChanges.Count}; message={message}");
+        await RefreshStatusAsync();
+        if (result?.ExitCode == 0)
+        {
+            await LoadRepositoryHistoryAsync();
+            SelectTab("History");
+        }
+    }
+
+    private async Task<ProcessResult?> RunSvnOperationAsync(string busyText, Func<Task<ProcessResult>> operation)
+    {
+        SetBusy(true, busyText);
+        try
+        {
+            var result = await operation();
+            WriteOutput(result.CombinedOutput);
+            if (result.ExitCode != 0)
+            {
+                MessageBox.Show("SVN 命令执行失败，请查看下方输出。", "执行失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+            return null;
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private void ChooseWorkingCopy()
+    {
+        using var dialog = new FolderBrowserDialog
+        {
+            Description = "选择 SVN 工作目录",
+            UseDescriptionForTitle = true,
+            SelectedPath = Directory.Exists(_workingCopyText.Text.Trim()) ? _workingCopyText.Text.Trim() : Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+        };
+        if (dialog.ShowDialog(this) == DialogResult.OK)
+        {
+            _workingCopyText.Text = dialog.SelectedPath;
+            SaveCurrentRepository();
+        }
+    }
+
+    private void OpenWorkingCopyFolder()
+    {
+        var path = _workingCopyText.Text.Trim();
+        if (!Directory.Exists(path))
+        {
+            MessageBox.Show("本地目录不存在。", "无法打开", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        Process.Start(new ProcessStartInfo("explorer.exe", path) { UseShellExecute = true });
+    }
+
+    private void LoadAllFiles()
+    {
+        var search = _fileTreeSearchText.Text.Trim();
+        var changedOnly = _fileTreeChangedOnlyCheck.Checked;
+        var isFiltering = changedOnly || !string.IsNullOrWhiteSpace(search);
+        var expandedPaths = isFiltering ? new HashSet<string>(StringComparer.OrdinalIgnoreCase) : GetExpandedTreePaths();
+        if (expandedPaths.Count == 0)
+        {
+            expandedPaths = _settings.GetExpandedPaths(CurrentWorkingCopyKey());
+        }
+
+        _loadingFileTree = true;
+        _fileTree.BeginUpdate();
+        _fileTree.Nodes.Clear();
+        try
+        {
+            var root = _workingCopyText.Text.Trim();
+            if (!Directory.Exists(root))
+            {
+                return;
+            }
+
+            var rootInfo = new DirectoryInfo(root);
+            var rootNode = new TreeNode(rootInfo.Name)
+            {
+                Tag = new FileTreeNodeInfo("", false),
+                ToolTipText = root,
+                ImageKey = "folder",
+                SelectedImageKey = "folder",
+            };
+            _fileTree.Nodes.Add(rootNode);
+            var statusMap = GetStatusMapForTree();
+            var files = Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
+                .Where(path => !path.Contains($"{Path.DirectorySeparatorChar}.svn{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
+                .Where(path => !SvnConflictArtifact.IsAuxiliaryPath(Path.GetRelativePath(root, path)))
+                .Select(path => new FileInfo(path))
+                .Where(file =>
+                {
+                    var relativePath = Path.GetRelativePath(root, file.FullName);
+                    var normalized = NormalizeRelativePath(relativePath);
+                    var hasStatus = statusMap.TryGetValue(normalized, out var status) && status != SvnStatusKind.None && status != SvnStatusKind.Normal;
+                    if (changedOnly && !hasStatus)
+                    {
+                        return false;
+                    }
+
+                    return string.IsNullOrWhiteSpace(search) ||
+                        relativePath.Contains(search, StringComparison.OrdinalIgnoreCase) ||
+                        file.Name.Contains(search, StringComparison.OrdinalIgnoreCase);
+                })
+                .OrderBy(file => Path.GetRelativePath(root, file.FullName))
+                .ToList();
+
+            foreach (var file in files)
+            {
+                var relativePath = Path.GetRelativePath(root, file.FullName);
+                statusMap.TryGetValue(NormalizeRelativePath(relativePath), out var status);
+                AddFileNode(rootNode, relativePath, file, status);
+            }
+            if (isFiltering)
+            {
+                rootNode.ExpandAll();
+            }
+            else
+            {
+                RestoreExpandedTreePaths(expandedPaths);
+            }
+
+            _fileTree.Sort();
+            PruneFileTreeSelection();
+            ApplyFileTreeSelectionStyles();
+        }
+        finally
+        {
+            _fileTree.EndUpdate();
+            _loadingFileTree = false;
+        }
+    }
+
+    private void CollapseFileTreeToRoot()
+    {
+        _fileTree.CollapseAll();
+        if (_fileTree.Nodes.Count > 0)
+        {
+            _fileTree.Nodes[0].Expand();
+        }
+    }
+
+    private void HandleFileTreeNodeMouseClick(TreeNode? node, MouseButtons button)
+    {
+        if (node == null)
+        {
+            return;
+        }
+
+        if (button == MouseButtons.Left)
+        {
+            SelectFileTreeNode(node, ModifierKeys);
+            return;
+        }
+
+        if (button == MouseButtons.Right)
+        {
+            if (!IsFileTreeNodeSelected(node))
+            {
+                SelectFileTreeNode(node, Keys.None);
+            }
+
+            _fileTree.SelectedNode = node;
+        }
+    }
+
+    private void SelectFileTreeNode(TreeNode node, Keys modifiers)
+    {
+        var path = GetFileTreeSelectionPath(node);
+        if (path == null)
+        {
+            _selectedFileTreePaths.Clear();
+            _fileTreeSelectionAnchorPath = null;
+            _fileTree.SelectedNode = node;
+            ApplyFileTreeSelectionStyles();
+            return;
+        }
+
+        if (modifiers.HasFlag(Keys.Shift) && !string.IsNullOrWhiteSpace(_fileTreeSelectionAnchorPath))
+        {
+            SelectFileTreeRange(_fileTreeSelectionAnchorPath, path);
+        }
+        else if (modifiers.HasFlag(Keys.Control))
+        {
+            if (!_selectedFileTreePaths.Add(path))
+            {
+                _selectedFileTreePaths.Remove(path);
+            }
+        }
+        else
+        {
+            _selectedFileTreePaths.Clear();
+            _selectedFileTreePaths.Add(path);
+        }
+
+        _fileTreeSelectionAnchorPath = path;
+        _fileTree.SelectedNode = node;
+        ApplyFileTreeSelectionStyles();
+    }
+
+    private void SelectFileTreeRange(string anchorPath, string currentPath)
+    {
+        var visibleNodes = GetVisibleFileTreeNodes().ToList();
+        var anchorIndex = visibleNodes.FindIndex(node => string.Equals(GetFileTreeSelectionPath(node), anchorPath, StringComparison.OrdinalIgnoreCase));
+        var currentIndex = visibleNodes.FindIndex(node => string.Equals(GetFileTreeSelectionPath(node), currentPath, StringComparison.OrdinalIgnoreCase));
+        if (anchorIndex < 0 || currentIndex < 0)
+        {
+            _selectedFileTreePaths.Clear();
+            _selectedFileTreePaths.Add(currentPath);
+            return;
+        }
+
+        _selectedFileTreePaths.Clear();
+        var start = Math.Min(anchorIndex, currentIndex);
+        var end = Math.Max(anchorIndex, currentIndex);
+        for (var index = start; index <= end; index++)
+        {
+            var path = GetFileTreeSelectionPath(visibleNodes[index]);
+            if (path != null)
+            {
+                _selectedFileTreePaths.Add(path);
+            }
+        }
+    }
+
+    private IEnumerable<TreeNode> GetVisibleFileTreeNodes()
+    {
+        foreach (TreeNode node in _fileTree.Nodes)
+        {
+            foreach (var child in EnumerateVisibleNodes(node))
+            {
+                yield return child;
+            }
+        }
+    }
+
+    private static IEnumerable<TreeNode> EnumerateVisibleNodes(TreeNode node)
+    {
+        yield return node;
+        if (!node.IsExpanded)
+        {
+            yield break;
+        }
+
+        foreach (TreeNode child in node.Nodes)
+        {
+            foreach (var visibleChild in EnumerateVisibleNodes(child))
+            {
+                yield return visibleChild;
+            }
+        }
+    }
+
+    private bool IsFileTreeNodeSelected(TreeNode node)
+    {
+        var path = GetFileTreeSelectionPath(node);
+        return path != null && _selectedFileTreePaths.Contains(path);
+    }
+
+    private static string? GetFileTreeSelectionPath(TreeNode? node)
+    {
+        if (node?.Tag is not FileTreeNodeInfo info || string.IsNullOrWhiteSpace(info.RelativePath))
+        {
+            return null;
+        }
+
+        return NormalizeRelativePath(SvnConflictArtifact.NormalizeToBasePath(info.RelativePath));
+    }
+
+    private void ApplyFileTreeSelectionStyles()
+    {
+        foreach (TreeNode node in _fileTree.Nodes)
+        {
+            ApplyFileTreeSelectionStyles(node);
+        }
+    }
+
+    private void ApplyFileTreeSelectionStyles(TreeNode node)
+    {
+        var selected = IsFileTreeNodeSelected(node);
+        if (selected)
+        {
+            node.BackColor = Color.FromArgb(0, 120, 215);
+            node.ForeColor = Color.White;
+        }
+        else
+        {
+            node.BackColor = _fileTree.BackColor;
+            node.ForeColor = GetFileTreeDefaultForeColor(node);
+        }
+
+        foreach (TreeNode child in node.Nodes)
+        {
+            ApplyFileTreeSelectionStyles(child);
+        }
+    }
+
+    private static Color GetFileTreeDefaultForeColor(TreeNode node)
+    {
+        if (node.Tag is FileTreeNodeInfo { IsFile: false })
+        {
+            return Color.FromArgb(55, 65, 81);
+        }
+
+        return StatusFromNodeText(node.Text) switch
+        {
+            SvnStatusKind.Modified => StatusColor(SvnStatusKind.Modified),
+            SvnStatusKind.Added => StatusColor(SvnStatusKind.Added),
+            SvnStatusKind.Deleted => StatusColor(SvnStatusKind.Deleted),
+            SvnStatusKind.Unversioned => StatusColor(SvnStatusKind.Unversioned),
+            SvnStatusKind.Missing => StatusColor(SvnStatusKind.Missing),
+            SvnStatusKind.Conflicted => StatusColor(SvnStatusKind.Conflicted),
+            SvnStatusKind.Replaced => StatusColor(SvnStatusKind.Replaced),
+            _ => SystemColors.WindowText,
+        };
+    }
+
+    private static SvnStatusKind StatusFromNodeText(string text)
+    {
+        if (text.Length < 2 || text[1] != ' ')
+        {
+            return SvnStatusKind.None;
+        }
+
+        return text[0] switch
+        {
+            'M' => SvnStatusKind.Modified,
+            'A' => SvnStatusKind.Added,
+            'D' => SvnStatusKind.Deleted,
+            '?' => SvnStatusKind.Unversioned,
+            '!' => SvnStatusKind.Missing,
+            'C' => SvnStatusKind.Conflicted,
+            'R' => SvnStatusKind.Replaced,
+            _ => SvnStatusKind.None,
+        };
+    }
+
+    private void PruneFileTreeSelection()
+    {
+        if (_selectedFileTreePaths.Count == 0)
+        {
+            return;
+        }
+
+        var existingPaths = GetAllFileTreeSelectablePaths().ToHashSet(StringComparer.OrdinalIgnoreCase);
+        _selectedFileTreePaths.RemoveWhere(path => !existingPaths.Contains(path));
+        if (_fileTreeSelectionAnchorPath != null && !existingPaths.Contains(_fileTreeSelectionAnchorPath))
+        {
+            _fileTreeSelectionAnchorPath = _selectedFileTreePaths.FirstOrDefault();
+        }
+    }
+
+    private IEnumerable<string> GetAllFileTreeSelectablePaths()
+    {
+        foreach (TreeNode node in _fileTree.Nodes)
+        {
+            foreach (var path in GetAllFileTreeSelectablePaths(node))
+            {
+                yield return path;
+            }
+        }
+    }
+
+    private static IEnumerable<string> GetAllFileTreeSelectablePaths(TreeNode node)
+    {
+        var path = GetFileTreeSelectionPath(node);
+        if (path != null)
+        {
+            yield return path;
+        }
+
+        foreach (TreeNode child in node.Nodes)
+        {
+            foreach (var childPath in GetAllFileTreeSelectablePaths(child))
+            {
+                yield return childPath;
+            }
+        }
+    }
+
+    private TreeNode? FindFileTreeNodeByPath(string relativePath)
+    {
+        var normalizedPath = NormalizeRelativePath(SvnConflictArtifact.NormalizeToBasePath(relativePath));
+        foreach (TreeNode node in _fileTree.Nodes)
+        {
+            var found = FindFileTreeNodeByPath(node, normalizedPath);
+            if (found != null)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+
+    private static TreeNode? FindFileTreeNodeByPath(TreeNode node, string normalizedPath)
+    {
+        var nodePath = GetFileTreeSelectionPath(node);
+        if (nodePath != null && string.Equals(nodePath, normalizedPath, StringComparison.OrdinalIgnoreCase))
+        {
+            return node;
+        }
+
+        foreach (TreeNode child in node.Nodes)
+        {
+            var found = FindFileTreeNodeByPath(child, normalizedPath);
+            if (found != null)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+
+    private static void AddFileNode(TreeNode rootNode, string relativePath, FileInfo file, SvnStatusKind status)
+    {
+        var parts = relativePath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var current = rootNode;
+        var currentPath = "";
+        for (var index = 0; index < parts.Length; index++)
+        {
+            var part = parts[index];
+            currentPath = string.IsNullOrEmpty(currentPath) ? part : Path.Combine(currentPath, part);
+            var isFile = index == parts.Length - 1;
+            var existing = current.Nodes.Cast<TreeNode>().FirstOrDefault(node => string.Equals(CleanTreeNodeText(node.Text), part, StringComparison.OrdinalIgnoreCase));
+            if (existing == null)
+            {
+                existing = new TreeNode(part)
+                {
+                    Tag = new FileTreeNodeInfo(currentPath, isFile),
+                    ToolTipText = isFile
+                        ? $"{currentPath}\r\n修改时间：{file.LastWriteTime:yyyy-MM-dd HH:mm}\r\n大小：{FormatBytes(file.Length)}"
+                        : currentPath,
+                    ImageKey = isFile ? FileImageKey(currentPath, status) : "folder",
+                    SelectedImageKey = isFile ? FileImageKey(currentPath, status) : "folder",
+                    ForeColor = isFile ? SystemColors.WindowText : Color.FromArgb(55, 65, 81),
+                };
+                if (!isFile)
+                {
+                    existing.NodeFont = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+                }
+
+                current.Nodes.Add(existing);
+            }
+
+            if (isFile && status != SvnStatusKind.None && status != SvnStatusKind.Normal)
+            {
+                existing.Text = $"{StatusPrefix(status)} {part}";
+                existing.ForeColor = StatusColor(status);
+                existing.ToolTipText += $"\r\n状态：{StatusText(status)}";
+                existing.ImageKey = "changed";
+                existing.SelectedImageKey = "changed";
+            }
+
+            current = existing;
+        }
+    }
+
+    private static string FileImageKey(string path, SvnStatusKind status)
+    {
+        if (status != SvnStatusKind.None && status != SvnStatusKind.Normal)
+        {
+            return "changed";
+        }
+
+        var extension = Path.GetExtension(path);
+        if (extension.Equals(".xml", StringComparison.OrdinalIgnoreCase) || extension.Equals(".xls", StringComparison.OrdinalIgnoreCase) || extension.Equals(".xlsx", StringComparison.OrdinalIgnoreCase))
+        {
+            return "xml";
+        }
+
+        return extension.Equals(".lua", StringComparison.OrdinalIgnoreCase) ? "lua" : "file";
+    }
+
+    private static string CleanTreeNodeText(string text)
+    {
+        return text.Length > 2 && text[1] == ' ' && "MAD?!CR".Contains(text[0], StringComparison.Ordinal)
+            ? text[2..]
+            : text;
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes >= 1024 * 1024)
+        {
+            return $"{bytes / 1024d / 1024d:0.##} MB";
+        }
+
+        return bytes >= 1024 ? $"{bytes / 1024d:0.##} KB" : $"{bytes} B";
+    }
+
+    private Dictionary<string, SvnStatusKind> GetStatusMapForTree()
+    {
+        try
+        {
+            return _svn.GetStatus(_workingCopyText.Text.Trim())
+                .ToDictionary(change => NormalizeRelativePath(change.RelativePath), change => change.Status, StringComparer.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return new Dictionary<string, SvnStatusKind>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    private static string NormalizeRelativePath(string path)
+    {
+        return path.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+    }
+
+    private static string StatusPrefix(SvnStatusKind status)
+    {
+        return status switch
+        {
+            SvnStatusKind.Modified => "M",
+            SvnStatusKind.Added => "A",
+            SvnStatusKind.Deleted => "D",
+            SvnStatusKind.Unversioned => "?",
+            SvnStatusKind.Missing => "!",
+            SvnStatusKind.Conflicted => "C",
+            SvnStatusKind.Replaced => "R",
+            _ => "",
+        };
+    }
+
+    private static string StatusText(SvnStatusKind status)
+    {
+        return status switch
+        {
+            SvnStatusKind.Modified => "已修改",
+            SvnStatusKind.Added => "已新增",
+            SvnStatusKind.Deleted => "已删除",
+            SvnStatusKind.Unversioned => "未加入版本控制",
+            SvnStatusKind.Missing => "本地缺失",
+            SvnStatusKind.Conflicted => "冲突",
+            SvnStatusKind.Replaced => "已替换",
+            _ => "",
+        };
+    }
+
+    private static Color StatusColor(SvnStatusKind status)
+    {
+        return status switch
+        {
+            SvnStatusKind.Modified => Color.FromArgb(166, 103, 34),
+            SvnStatusKind.Added => Color.FromArgb(38, 128, 72),
+            SvnStatusKind.Deleted => Color.FromArgb(170, 67, 67),
+            SvnStatusKind.Unversioned => Color.FromArgb(93, 88, 161),
+            SvnStatusKind.Missing => Color.FromArgb(170, 67, 67),
+            SvnStatusKind.Conflicted => Color.FromArgb(190, 50, 50),
+            SvnStatusKind.Replaced => Color.FromArgb(128, 79, 160),
+            _ => SystemColors.WindowText,
+        };
+    }
+
+    private string? GetSelectedRelativePath()
+    {
+        var selectedChange = GetSelectedChange();
+        if (selectedChange != null)
+        {
+            return SvnConflictArtifact.NormalizeToBasePath(selectedChange.RelativePath);
+        }
+
+        if (_conflictGrid.SelectedRows.Count == 1 &&
+            _conflictGrid.SelectedRows[0].DataBoundItem is ConflictGridRow conflict)
+        {
+            return conflict.RelativePath;
+        }
+
+        if (_selectedFileTreePaths.Count == 1)
+        {
+            var selectedPath = _selectedFileTreePaths.First();
+            if (FindFileTreeNodeByPath(selectedPath)?.Tag is FileTreeNodeInfo { IsFile: true })
+            {
+                return SvnConflictArtifact.NormalizeToBasePath(selectedPath);
+            }
+        }
+
+        if (_fileTree.SelectedNode?.Tag is FileTreeNodeInfo { IsFile: true } fileNode && !string.IsNullOrWhiteSpace(fileNode.RelativePath))
+        {
+            return SvnConflictArtifact.NormalizeToBasePath(fileNode.RelativePath);
+        }
+
+        return null;
+    }
+
+    private IReadOnlyList<string> GetSelectedFileTreeHistoryPaths()
+    {
+        if (_selectedFileTreePaths.Count > 0)
+        {
+            return RemoveNestedPaths(_selectedFileTreePaths)
+                .Select(SvnConflictArtifact.NormalizeToBasePath)
+                .ToList();
+        }
+
+        if (_fileTree.SelectedNode?.Tag is FileTreeNodeInfo nodeInfo && !string.IsNullOrWhiteSpace(nodeInfo.RelativePath))
+        {
+            return [SvnConflictArtifact.NormalizeToBasePath(nodeInfo.RelativePath)];
+        }
+
+        var selectedChange = GetSelectedChange();
+        if (selectedChange != null)
+        {
+            return [SvnConflictArtifact.NormalizeToBasePath(selectedChange.RelativePath)];
+        }
+
+        if (_conflictGrid.SelectedRows.Count == 1 &&
+            _conflictGrid.SelectedRows[0].DataBoundItem is ConflictGridRow conflict)
+        {
+            return [conflict.RelativePath];
+        }
+
+        return [];
+    }
+
+    private static IReadOnlyList<string> RemoveNestedPaths(IEnumerable<string> paths)
+    {
+        var normalized = paths
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Select(path => path.Replace('\\', '/').Trim('/'))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var result = new List<string>();
+        foreach (var path in normalized)
+        {
+            if (result.Any(parent => path.StartsWith(parent + "/", StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            result.Add(path);
+        }
+
+        return result;
+    }
+
+    private SvnChange? GetSelectedChange()
+    {
+        return _changesList.SelectedItems.Count == 1 && _changesList.SelectedItems[0].Tag is SvnChange change
+            ? change
+            : null;
+    }
+
+    private string CurrentWorkingCopyKey()
+    {
+        return _workingCopyText.Text.Trim();
+    }
+
+    private HashSet<string> GetExpandedTreePaths()
+    {
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (TreeNode node in _fileTree.Nodes)
+        {
+            CollectExpandedTreePaths(node, paths);
+        }
+
+        return paths;
+    }
+
+    private static void CollectExpandedTreePaths(TreeNode node, HashSet<string> paths)
+    {
+        if (node.IsExpanded && node.Tag is FileTreeNodeInfo { IsFile: false } info)
+        {
+            paths.Add(info.RelativePath);
+        }
+
+        foreach (TreeNode child in node.Nodes)
+        {
+            CollectExpandedTreePaths(child, paths);
+        }
+    }
+
+    private void RestoreExpandedTreePaths(HashSet<string> paths)
+    {
+        if (_fileTree.Nodes.Count == 0)
+        {
+            return;
+        }
+
+        _fileTree.Nodes[0].Expand();
+        foreach (TreeNode node in _fileTree.Nodes)
+        {
+            RestoreExpandedTreePaths(node, paths);
+        }
+    }
+
+    private static void RestoreExpandedTreePaths(TreeNode node, HashSet<string> paths)
+    {
+        if (node.Tag is FileTreeNodeInfo { IsFile: false } info && paths.Contains(info.RelativePath))
+        {
+            node.Expand();
+        }
+
+        foreach (TreeNode child in node.Nodes)
+        {
+            RestoreExpandedTreePaths(child, paths);
+        }
+    }
+
+    private void SaveTreeExpansionState()
+    {
+        if (_loadingFileTree)
+        {
+            return;
+        }
+
+        _settings.SetExpandedPaths(CurrentWorkingCopyKey(), GetExpandedTreePaths());
+        _settings.Save();
+    }
+
+    private void FillHistoryList(IReadOnlyList<SvnLogEntry> logs)
+    {
+        var workingCopy = _workingCopyText.Text.Trim();
+        var info = Directory.Exists(workingCopy) ? _svn.GetWorkingCopyInfo(workingCopy) : WorkingCopyInfo.Empty;
+        var changes = Directory.Exists(workingCopy) ? _svn.GetStatus(workingCopy) : [];
+        _historyRows = [];
+        ShowHistorySummary(info == WorkingCopyInfo.Empty
+            ? ""
+            : $"当前工作副本版本：{info.DisplayRevisionText}{Environment.NewLine}当前文件内容最高版本：r{info.MaxRevision}{Environment.NewLine}{info.Url}");
+        if (changes.Count > 0)
+        {
+            var uncommitted = new SvnLogEntry(0, "*", DateTimeOffset.Now, $"Uncommitted changes ({changes.Count} files)")
+            {
+                IsUncommitted = true,
+                ChangedFiles = changes.Select(change => ChangedFileEntry.FromWorkingCopy(change.Status, change.RelativePath)).ToList(),
+            };
+            _historyRows.Add(uncommitted);
+        }
+
+        foreach (var log in logs)
+        {
+            _historyRows.Add(log with { IsWorkingCopyRevision = log.Revision == info.MaxRevision });
+        }
+        ApplyHistoryFilter(selectWorkingCopyRevision: true);
+    }
+
+    private void ApplyHistoryFilter(bool selectWorkingCopyRevision = false)
+    {
+        var filter = HistorySearchFilter.Parse(_historySearchText.Text);
+        var rows = filter.IsEmpty
+            ? _historyRows
+            : _historyRows.Where(log => filter.Matches(log)).ToList();
+        _historyList.BeginUpdate();
+        _historyList.Items.Clear();
+        _historyChangedFilesTree.Nodes.Clear();
+        foreach (var row in rows)
+        {
+            AddHistoryItem(row);
+        }
+        _historyList.EndUpdate();
+
+        if (_historyList.Items.Count == 0)
+        {
+            _selectedHistoryLog = null;
+            ShowHistorySummary(filter.IsEmpty ? "" : "没有匹配的提交。");
+            return;
+        }
+
+        var itemToSelect = selectWorkingCopyRevision || filter.IsEmpty
+            ? _historyList.Items.Cast<ListViewItem>().FirstOrDefault(item => item.Tag is SvnLogEntry { IsWorkingCopyRevision: true })
+            : null;
+        itemToSelect ??= _historyList.Items[0];
+        itemToSelect.Selected = true;
+        itemToSelect.Focused = true;
+        itemToSelect.EnsureVisible();
+    }
+
+    private void AddHistoryItem(SvnLogEntry log)
+    {
+        var item = new ListViewItem(log.GraphText) { Tag = log };
+        item.SubItems.Add(log.DescriptionText);
+        item.SubItems.Add(log.LocalDateText);
+        item.SubItems.Add(log.Author);
+        item.SubItems.Add(log.RevisionText);
+        if (log.IsUncommitted)
+        {
+            item.Font = new Font(_historyList.Font, FontStyle.Bold);
+            item.BackColor = Color.FromArgb(255, 250, 230);
+        }
+        else if (log.IsWorkingCopyRevision)
+        {
+            item.BackColor = Color.FromArgb(221, 235, 247);
+            item.Font = new Font(_historyList.Font, FontStyle.Bold);
+        }
+
+        _historyList.Items.Add(item);
+    }
+
+    private void FocusFirstChangedFileInSelectedHistory()
+    {
+        if (_historyList.SelectedItems.Count != 1 || _historyList.SelectedItems[0].Tag is not SvnLogEntry log)
+        {
+            return;
+        }
+
+        _selectedHistoryLog = log;
+        PopulateHistoryChangedFiles(log);
+        var filter = HistorySearchFilter.Parse(_historySearchText.Text);
+        var firstFileNode = FindBestChangedFileNode(_historyChangedFilesTree.Nodes.Cast<TreeNode>(), filter);
+        if (firstFileNode == null)
+        {
+            return;
+        }
+
+        firstFileNode.EnsureVisible();
+        _historyChangedFilesTree.SelectedNode = firstFileNode;
+        _historyChangedFilesTree.Focus();
+    }
+
+    private static TreeNode? FindBestChangedFileNode(IEnumerable<TreeNode> nodes, HistorySearchFilter filter)
+    {
+        if (!filter.IsEmpty)
+        {
+            var matched = FindChangedFileNode(nodes, file => filter.MatchesFile(file));
+            if (matched != null)
+            {
+                return matched;
+            }
+        }
+
+        return FindFirstChangedFileNode(nodes);
+    }
+
+    private static TreeNode? FindChangedFileNode(IEnumerable<TreeNode> nodes, Func<ChangedFileEntry, bool> predicate)
+    {
+        foreach (var node in nodes)
+        {
+            if (node.Tag is ChangedFileEntry file && predicate(file))
+            {
+                return node;
+            }
+
+            var child = FindChangedFileNode(node.Nodes.Cast<TreeNode>(), predicate);
+            if (child != null)
+            {
+                return child;
+            }
+        }
+
+        return null;
+    }
+
+    private static TreeNode? FindFirstChangedFileNode(IEnumerable<TreeNode> nodes)
+    {
+        foreach (var node in nodes)
+        {
+            if (node.Tag is ChangedFileEntry)
+            {
+                return node;
+            }
+
+            var child = FindFirstChangedFileNode(node.Nodes.Cast<TreeNode>());
+            if (child != null)
+            {
+                return child;
+            }
+        }
+
+        return null;
+    }
+
+    private void BuildHistoryListMenu()
+    {
+        _historyListMenu.Items.Clear();
+        _historyListMenu.Items.Add("定位本次改动文件", null, (_, _) => FocusFirstChangedFileInSelectedHistory());
+        _historyListMenu.Items.Add("回退工作副本到此版本...", null, async (_, _) => await RunUpdateWorkingCopyToSelectedHistoryRevisionAsync());
+        _historyListMenu.Items.Add(new ToolStripSeparator());
+        _historyListMenu.Items.Add("复制版本号", null, (_, _) => CopySelectedHistoryRevision());
+        _historyListMenu.Items.Add("刷新历史", null, async (_, _) => await LoadRepositoryHistoryAsync());
+        _historyListMenu.Opening += (_, args) =>
+        {
+            var log = GetSingleSelectedHistoryLog();
+            var hasCommittedRevision = log != null && !log.IsUncommitted && log.Revision > 0;
+            foreach (ToolStripItem item in _historyListMenu.Items)
+            {
+                item.Enabled = hasCommittedRevision || item.Text == "刷新历史";
+            }
+        };
+    }
+
+    private void SelectHistoryItemForContextMenu(MouseEventArgs args)
+    {
+        if (args.Button != MouseButtons.Right)
+        {
+            return;
+        }
+
+        var item = _historyList.GetItemAt(args.X, args.Y);
+        if (item == null)
+        {
+            return;
+        }
+
+        if (!item.Selected)
+        {
+            _historyList.SelectedItems.Clear();
+            item.Selected = true;
+            item.Focused = true;
+        }
+    }
+
+    private SvnLogEntry? GetSingleSelectedHistoryLog()
+    {
+        return _historyList.SelectedItems.Count == 1 && _historyList.SelectedItems[0].Tag is SvnLogEntry log
+            ? log
+            : null;
+    }
+
+    private void CopySelectedHistoryRevision()
+    {
+        var log = GetSingleSelectedHistoryLog();
+        if (log == null || log.IsUncommitted)
+        {
+            return;
+        }
+
+        Clipboard.SetText(log.Revision.ToString());
+        WriteOutput($"已复制版本号：r{log.Revision}");
+    }
+
+    private async Task RunUpdateWorkingCopyToSelectedHistoryRevisionAsync()
+    {
+        var log = GetSingleSelectedHistoryLog();
+        if (log == null || log.IsUncommitted || log.Revision <= 0 || !ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        var workingCopy = _workingCopyText.Text.Trim();
+        var changes = await _svn.GetStatusAsync(workingCopy);
+        if (!ConfirmUpdateToRevision(log, changes))
+        {
+            OperationLogger.Log("UpdateToRevisionCancelled", workingCopy, $"revision={log.Revision}; localChanges={changes.Count}");
+            return;
+        }
+
+        OperationLogger.Log("UpdateToRevisionStart", workingCopy, $"revision={log.Revision}; localChanges={changes.Count}");
+        var result = await RunSvnOperationAsync($"正在回退到 r{log.Revision}...", async () => await _svn.UpdateToRevisionAsync(workingCopy, log.Revision));
+        OperationLogger.Log(result?.ExitCode == 0 ? "UpdateToRevisionSuccess" : "UpdateToRevisionFailed", workingCopy, $"revision={log.Revision}");
+        await RefreshStatusAsync();
+        LoadAllFiles();
+        await LoadRepositoryHistoryAsync();
+        await CheckRemoteChangesAsync(showUpToDateMessage: false);
+    }
+
+    private bool ConfirmUpdateToRevision(SvnLogEntry log, IReadOnlyList<SvnChange> changes)
+    {
+        var localChangeText = changes.Count == 0
+            ? "当前没有本地改动。"
+            : $"当前有 {changes.Count} 个本地改动；继续回退可能产生冲突，建议先提交、备份或清理。";
+        var message =
+            $"准备把整个工作副本更新到历史版本 r{log.Revision}。{Environment.NewLine}{Environment.NewLine}" +
+            $"{log.LocalDateText}  {log.Author}{Environment.NewLine}" +
+            $"{log.ShortMessage}{Environment.NewLine}{Environment.NewLine}" +
+            $"{localChangeText}{Environment.NewLine}{Environment.NewLine}" +
+            "这个操作不会修改 SVN 服务器历史，也不会自动提交；只是把你的本地工作副本切到该历史版本。确认继续？";
+        var result = MessageBox.Show(
+            message,
+            "回退工作副本到历史版本",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2);
+        return result == DialogResult.OK;
+    }
+
+    private async Task SelectSidebarRepositoryAsync(TreeNode? node)
+    {
+        if (_loadingRepository)
+        {
+            return;
+        }
+
+        if (node?.Tag is not RepositoryEntry repository)
+        {
+            return;
+        }
+
+        _settings.CurrentRepositoryId = repository.Id;
+        _repoUrlText.Text = repository.RepositoryUrl;
+        _workingCopyText.Text = repository.WorkingCopyPath;
+        _settings.Save();
+        _latestRemoteLog = null;
+        _remoteStatusLabel.Text = "远端：未检查";
+        _remoteStatusLabel.ForeColor = SystemColors.ControlText;
+        _changesList.Items.Clear();
+        RefreshConflictPanel([]);
+        UpdateStatusBadges(0, 0);
+        _historyList.Items.Clear();
+        UpdateHistoryBadge(0);
+        _historyDetailText.Clear();
+        LoadAllFiles();
+        await LoadCurrentTabAsync();
+    }
+
+    private void OpenTreeFile(TreeNode node)
+    {
+        if (node.Tag is not FileTreeNodeInfo { IsFile: true } fileNode || string.IsNullOrWhiteSpace(fileNode.RelativePath))
+        {
+            node.Toggle();
+            return;
+        }
+
+        var filePath = Path.Combine(_workingCopyText.Text.Trim(), fileNode.RelativePath);
+        if (File.Exists(filePath))
+        {
+            Process.Start(new ProcessStartInfo(filePath) { UseShellExecute = true });
+        }
+    }
+
+    private void BuildFileTreeMenu()
+    {
+        _fileTreeMenu.Items.Clear();
+        _fileTreeMenu.Items.Add("打开文件", null, (_, _) => OpenSelectedTreeFile());
+        _fileTreeMenu.Items.Add("打开所在目录", null, (_, _) => OpenSelectedTreeFileFolder());
+        _fileTreeMenu.Items.Add(new ToolStripSeparator());
+        _fileTreeMenu.Items.Add("查看差异", null, async (_, _) => await RunDiffAsync());
+        _fileTreeMenu.Items.Add("查看冲突", null, async (_, _) => await RunConflictViewerAsync());
+        _fileTreeMenu.Items.Add("用分久必合对比/合并", null, async (_, _) => await RunExternalCompareOrMergeAsync());
+        _fileTreeMenu.Items.Add("冲突处理流程", null, async (_, _) => await RunConflictWorkflowAsync());
+        _fileTreeMenu.Items.Add("文件/文件夹历史", null, async (_, _) => await RunFileHistoryAsync());
+        _fileTreeMenu.Items.Add("清除选择", null, (_, _) => ClearFileTreeSelection());
+        _fileTreeMenu.Items.Add(new ToolStripSeparator());
+        _fileTreeMenu.Items.Add("加入版本控制", null, async (_, _) => await AddSelectedTreeFileAsync());
+        _fileTreeMenu.Items.Add("标记冲突已解决", null, async (_, _) => await ResolveSelectedTreeFileAsync());
+        _fileTreeMenu.Opening += (_, args) =>
+        {
+            var relativePath = GetSelectedRelativePath();
+            var hasFile = !string.IsNullOrWhiteSpace(relativePath);
+            var hasTreePath = GetSelectedFileTreeHistoryPaths().Count > 0;
+            foreach (ToolStripItem item in _fileTreeMenu.Items)
+            {
+                item.Enabled = item is ToolStripSeparator ||
+                    item.Text is "打开所在目录" && _fileTree.SelectedNode?.Tag is FileTreeNodeInfo ||
+                    item.Text is "文件/文件夹历史" && hasTreePath ||
+                    item.Text is "打开文件" && hasFile ||
+                    item.Text is "查看差异" && hasFile ||
+                    item.Text is "查看冲突" && hasFile ||
+                    item.Text is "用分久必合对比/合并" && hasFile ||
+                    item.Text is "冲突处理流程" && hasFile ||
+                    item.Text is "清除选择" && _selectedFileTreePaths.Count > 0 ||
+                    item.Text is "加入版本控制" && hasFile ||
+                    item.Text is "标记冲突已解决" && hasFile;
+            }
+        };
+    }
+
+    private void BuildHistoryChangedFilesMenu()
+    {
+        _historyChangedFilesMenu.Items.Clear();
+        _historyChangedFilesMenu.Items.Add("打开文件", null, async (_, _) => await OpenSelectedHistoryChangedFileAsync());
+        _historyChangedFilesMenu.Items.Add("打开所在目录", null, (_, _) => OpenSelectedHistoryChangedFileFolder());
+        _historyChangedFilesMenu.Items.Add(new ToolStripSeparator());
+        _historyChangedFilesMenu.Items.Add("用分久必合对比", null, async (_, _) => await RunSelectedHistoryChangedFileExternalCompareAsync());
+        _historyChangedFilesMenu.Items.Add("文件历史", null, async (_, _) => await RunSelectedHistoryChangedFileHistoryAsync());
+        _historyChangedFilesMenu.Items.Add("复制路径", null, (_, _) => CopySelectedHistoryChangedFilePath());
+        _historyChangedFilesMenu.Opening += (_, args) =>
+        {
+            var hasFile = _historyChangedFilesTree.SelectedNode?.Tag is ChangedFileEntry;
+            foreach (ToolStripItem item in _historyChangedFilesMenu.Items)
+            {
+                item.Enabled = item is ToolStripSeparator || hasFile;
+            }
+        };
+    }
+
+    private void OpenSelectedTreeFile()
+    {
+        if (_fileTree.SelectedNode != null)
+        {
+            OpenTreeFile(_fileTree.SelectedNode);
+        }
+    }
+
+    private void OpenSelectedTreeFileFolder()
+    {
+        if (_fileTree.SelectedNode?.Tag is not FileTreeNodeInfo nodeInfo)
+        {
+            return;
+        }
+
+        var path = Path.Combine(_workingCopyText.Text.Trim(), nodeInfo.RelativePath);
+        var folder = nodeInfo.IsFile ? Path.GetDirectoryName(path) : path;
+        if (!string.IsNullOrWhiteSpace(folder) && Directory.Exists(folder))
+        {
+            Process.Start(new ProcessStartInfo("explorer.exe", folder) { UseShellExecute = true });
+        }
+    }
+
+    private void ClearFileTreeSelection()
+    {
+        _selectedFileTreePaths.Clear();
+        _fileTreeSelectionAnchorPath = null;
+        ApplyFileTreeSelectionStyles();
+    }
+
+    private async Task OpenSelectedHistoryChangedFileAsync()
+    {
+        if (_historyChangedFilesTree.SelectedNode != null)
+        {
+            await OpenHistoryChangedFileAsync(_historyChangedFilesTree.SelectedNode);
+        }
+    }
+
+    private async Task OpenHistoryChangedFileAsync(TreeNode? node)
+    {
+        if (node?.Tag is not ChangedFileEntry file)
+        {
+            node?.Toggle();
+            return;
+        }
+
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        SetBusy(true, "正在打开历史版本文件...");
+        try
+        {
+            if (await OpenHistoryChangedFileVersionAsync(file))
+            {
+                return;
+            }
+
+            MessageBox.Show("没有找到可打开的文件版本。可能是历史版本中的已删除文件，或当前工作副本没有该路径。", "无法打开文件", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private async Task<bool> OpenHistoryChangedFileVersionAsync(ChangedFileEntry file)
+    {
+        if (_selectedHistoryLogs.Count > 1)
+        {
+            var committedLogs = _selectedHistoryLogs.Where(log => !log.IsUncommitted).OrderBy(log => log.Revision).ToList();
+            if (committedLogs.Count > 0)
+            {
+                var lastRevision = committedLogs.Last().Revision;
+                if (await TryOpenRepositoryFileVersionAsync(file, lastRevision, $"r{lastRevision}"))
+                {
+                    return true;
+                }
+
+                var beforeFirstRevision = committedLogs.First().Revision - 1;
+                if (beforeFirstRevision > 0 && await TryOpenRepositoryFileVersionAsync(file, beforeFirstRevision, $"r{beforeFirstRevision}"))
+                {
+                    WriteOutput($"范围结束版本没有该文件，已打开范围开始前版本：{file.DisplayText}");
+                    return true;
+                }
+
+                return false;
+            }
+        }
+
+        if (_selectedHistoryLog is { IsUncommitted: false } selectedLog)
+        {
+            var revision = file.Action == "D" ? selectedLog.Revision - 1 : selectedLog.Revision;
+            if (revision <= 0)
+            {
+                return false;
+            }
+
+            return await TryOpenRepositoryFileVersionAsync(file, revision, $"r{revision}");
+        }
+
+        var filePath = GetHistoryChangedLocalPath(file);
+        if (File.Exists(filePath))
+        {
+            Process.Start(new ProcessStartInfo(filePath) { UseShellExecute = true });
+            WriteOutput($"已打开本地文件：{file.RelativePath}");
+            return true;
+        }
+
+        return false;
+    }
+
+    private async Task<bool> TryOpenRepositoryFileVersionAsync(ChangedFileEntry file, long revision, string label)
+    {
+        if (string.IsNullOrWhiteSpace(file.RepositoryPath))
+        {
+            return false;
+        }
+
+        var workingCopy = _workingCopyText.Text.Trim();
+        var tempPath = CreateHistoryOpenTempPath(label, file.TreePath);
+        try
+        {
+            await _svn.WriteRepositoryFileAtRevisionAsync(workingCopy, file.RepositoryPath, revision, tempPath);
+            Process.Start(new ProcessStartInfo(tempPath) { UseShellExecute = true });
+            WriteOutput($"已打开历史版本 {label}：{file.DisplayText}");
+            return true;
+        }
+        catch
+        {
+            TryDelete(tempPath);
+            return false;
+        }
+    }
+
+    private void OpenSelectedHistoryChangedFileFolder()
+    {
+        if (_historyChangedFilesTree.SelectedNode?.Tag is not ChangedFileEntry file)
+        {
+            return;
+        }
+
+        var filePath = GetHistoryChangedLocalPath(file);
+        var folder = File.Exists(filePath) ? Path.GetDirectoryName(filePath) : Path.GetDirectoryName(filePath);
+        if (!string.IsNullOrWhiteSpace(folder) && Directory.Exists(folder))
+        {
+            Process.Start(new ProcessStartInfo("explorer.exe", folder) { UseShellExecute = true });
+        }
+    }
+
+    private async Task RunSelectedHistoryChangedFileHistoryAsync()
+    {
+        if (!ValidateWorkingCopyPath() || _historyChangedFilesTree.SelectedNode?.Tag is not ChangedFileEntry file)
+        {
+            return;
+        }
+
+        SetBusy(true, "正在读取文件历史...");
+        try
+        {
+            await ShowFileHistoryWindowAsync(file.RelativePath);
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private void CopySelectedHistoryChangedFilePath()
+    {
+        if (_historyChangedFilesTree.SelectedNode?.Tag is not ChangedFileEntry file)
+        {
+            return;
+        }
+
+        Clipboard.SetText(string.IsNullOrWhiteSpace(file.RepositoryPath) ? file.RelativePath : file.RepositoryPath);
+        WriteOutput($"已复制路径：{(string.IsNullOrWhiteSpace(file.RepositoryPath) ? file.RelativePath : file.RepositoryPath)}");
+    }
+
+    private string GetHistoryChangedLocalPath(ChangedFileEntry file)
+    {
+        return Path.Combine(_workingCopyText.Text.Trim(), file.RelativePath);
+    }
+
+    private async Task AddSelectedTreeFileAsync()
+    {
+        var relativePath = GetSelectedRelativePath();
+        if (string.IsNullOrWhiteSpace(relativePath))
+        {
+            return;
+        }
+
+        await RunSvnOperationAsync("正在加入版本控制...", async () => await _svn.AddAsync(_workingCopyText.Text.Trim(), relativePath));
+        await RefreshStatusAsync();
+        LoadAllFiles();
+    }
+
+    private async Task ResolveSelectedTreeFileAsync()
+    {
+        var relativePath = GetSelectedRelativePath();
+        if (string.IsNullOrWhiteSpace(relativePath))
+        {
+            return;
+        }
+
+        await ResolveConflictPathAsync(relativePath);
+    }
+
+    private void SelectTab(string text)
+    {
+        foreach (TabPage page in _mainTabs.TabPages)
+        {
+            if (IsTab(page, text))
+            {
+                _mainTabs.SelectedTab = page;
+                return;
+            }
+        }
+    }
+
+    private static bool IsTab(TabPage? page, string text)
+    {
+        return page != null &&
+            string.Equals(GetBaseTabText(page.Text), text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string GetBaseTabText(string text)
+    {
+        var index = text.IndexOf('(');
+        return (index > 0 ? text[..index] : text).Trim();
+    }
+
+    private async Task LoadCurrentTabAsync()
+    {
+        if (_mainTabs.SelectedTab?.Text == "全部文件")
+        {
+            LoadAllFiles();
+        }
+        else if (IsTab(_mainTabs.SelectedTab, "冲突"))
+        {
+            await RefreshStatusAsync();
+        }
+        else if (IsTab(_mainTabs.SelectedTab, "History") && _historyList.Items.Count == 0)
+        {
+            await LoadRepositoryHistoryAsync();
+        }
+    }
+
+    private bool ValidateRepositoryUrl()
+    {
+        if (!string.IsNullOrWhiteSpace(_repoUrlText.Text))
+        {
+            return true;
+        }
+
+        MessageBox.Show("请填写 SVN 地址。", "缺少 SVN 地址", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        return false;
+    }
+
+    private bool ValidateWorkingCopyPath(bool allowMissing = false)
+    {
+        var path = _workingCopyText.Text.Trim();
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            MessageBox.Show("请先选择本地目录。", "缺少本地目录", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+
+        if (!allowMissing && !Directory.Exists(path))
+        {
+            MessageBox.Show("本地目录不存在。", "目录错误", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+
+        return true;
+    }
+
+    private void SaveSettings()
+    {
+        _settings.UpsertRepository(_repoUrlText.Text.Trim(), _workingCopyText.Text.Trim());
+        _settings.Save();
+        RefreshRepositorySelector();
+    }
+
+    private void SaveCurrentRepository()
+    {
+        if (!ValidateWorkingCopyPath(allowMissing: true))
+        {
+            return;
+        }
+
+        SaveSettings();
+        WriteOutput($"已保存本地库：{_workingCopyText.Text.Trim()}");
+    }
+
+    private void RemoveCurrentRepository()
+    {
+        if (_settings.CurrentRepositoryId == null)
+        {
+            return;
+        }
+
+        _settings.Repositories.RemoveAll(repository => repository.Id == _settings.CurrentRepositoryId);
+        _settings.CurrentRepositoryId = _settings.Repositories.FirstOrDefault()?.Id;
+        _settings.Save();
+        RefreshRepositorySelector();
+        RefreshConflictPanel([]);
+        UpdateStatusBadges(0, 0);
+        _historyList.Items.Clear();
+        _historyRows.Clear();
+        UpdateHistoryBadge(0);
+        _historyDetailText.Clear();
+        var selected = _settings.GetCurrentRepository();
+        _repoUrlText.Text = selected?.RepositoryUrl ?? "svn://192.168.6.20:13690/xdqd_xml/trunk";
+        _workingCopyText.Text = selected?.WorkingCopyPath ?? "";
+        _changesList.Items.Clear();
+        LoadAllFiles();
+    }
+
+    private void RefreshRepositorySelector()
+    {
+        _loadingRepository = true;
+        try
+        {
+            _repositorySelector.Items.Clear();
+            foreach (var repository in _settings.Repositories)
+            {
+                _repositorySelector.Items.Add(repository);
+            }
+
+            var selected = _settings.GetCurrentRepository();
+            if (selected != null)
+            {
+                _repositorySelector.SelectedItem = selected;
+            }
+            else if (_repositorySelector.Items.Count > 0)
+            {
+                _repositorySelector.SelectedIndex = 0;
+            }
+        }
+        finally
+        {
+            _loadingRepository = false;
+        }
+
+        RefreshRepositoryTree();
+    }
+
+    private void RefreshRepositoryTree()
+    {
+        if (_repositoryTree.IsDisposed)
+        {
+            return;
+        }
+
+        var wasLoading = _loadingRepository;
+        _loadingRepository = true;
+        try
+        {
+            _repositoryTree.BeginUpdate();
+            _repositoryTree.Nodes.Clear();
+            var repositoriesNode = new TreeNode("本地库")
+            {
+                ImageKey = "folder",
+                SelectedImageKey = "folder",
+            };
+            _repositoryTree.Nodes.Add(repositoriesNode);
+            foreach (var repository in _settings.Repositories)
+            {
+                var node = new TreeNode(repository.Name)
+                {
+                    Tag = repository,
+                    ToolTipText = repository.WorkingCopyPath,
+                    ImageKey = "repo",
+                    SelectedImageKey = "repo",
+                    ForeColor = repository.Id == _settings.CurrentRepositoryId
+                        ? Color.FromArgb(0, 92, 175)
+                        : SystemColors.WindowText,
+                    NodeFont = repository.Id == _settings.CurrentRepositoryId
+                        ? new Font(_repositoryTree.Font, FontStyle.Bold)
+                        : _repositoryTree.Font,
+                };
+                repositoriesNode.Nodes.Add(node);
+                if (repository.Id == _settings.CurrentRepositoryId)
+                {
+                    _repositoryTree.SelectedNode = node;
+                    node.EnsureVisible();
+                }
+            }
+
+            repositoriesNode.Expand();
+        }
+        finally
+        {
+            _repositoryTree.EndUpdate();
+            _loadingRepository = wasLoading;
+        }
+    }
+
+    private void SelectRepositoryFromList()
+    {
+        if (_loadingRepository || _repositorySelector.SelectedItem is not RepositoryEntry repository)
+        {
+            return;
+        }
+
+        _settings.CurrentRepositoryId = repository.Id;
+        _repoUrlText.Text = repository.RepositoryUrl;
+        _workingCopyText.Text = repository.WorkingCopyPath;
+        _settings.Save();
+        RefreshRepositoryTree();
+        _changesList.Items.Clear();
+        RefreshConflictPanel([]);
+        UpdateStatusBadges(0, 0);
+        _historyList.Items.Clear();
+        _historyRows.Clear();
+        UpdateHistoryBadge(0);
+        _historyDetailText.Clear();
+        LoadAllFiles();
+    }
+
+    private void SetAllChecks(bool isChecked)
+    {
+        foreach (ListViewItem item in _changesList.Items)
+        {
+            if (item.Tag is SvnChange { CanCommit: true })
+            {
+                item.Checked = isChecked;
+            }
+        }
+    }
+
+    private void SetBusy(bool busy, string text)
+    {
+        _statusLabel.Text = text;
+        _checkoutButton.Enabled = !busy;
+        _updateButton.Enabled = !busy;
+        _statusButton.Enabled = !busy;
+        _commitButton.Enabled = !busy;
+        _diffButton.Enabled = !busy;
+        _externalMergeButton.Enabled = !busy;
+        _conflictWorkflowButton.Enabled = !busy;
+        _historyButton.Enabled = !busy;
+        UseWaitCursor = busy;
+    }
+
+    private void WriteOutput(string output)
+    {
+        _outputText.Text = string.IsNullOrWhiteSpace(output) ? "命令没有输出。" : output.Trim();
+    }
+
+    private void ShowError(Exception ex)
+    {
+        WriteOutput(ex.ToString());
+        MessageBox.Show(ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+    }
+
+    private void ShowSelectedHistoryDetail()
+    {
+        var selectedLogs = _historyList.SelectedItems
+            .Cast<ListViewItem>()
+            .Select(item => item.Tag as SvnLogEntry)
+            .Where(log => log != null)
+            .Cast<SvnLogEntry>()
+            .OrderBy(log => log.Revision)
+            .ToList();
+
+        if (selectedLogs.Count == 0)
+        {
+            _selectedHistoryLog = null;
+            _selectedHistoryLogs = [];
+            _historyChangedFilesTree.Nodes.Clear();
+            ShowHistorySummary("");
+            return;
+        }
+
+        if (selectedLogs.Count > 1)
+        {
+            _selectedHistoryLog = null;
+            _selectedHistoryLogs = selectedLogs;
+            ShowSelectedHistoryRangeDetail(selectedLogs);
+            return;
+        }
+
+        var log = selectedLogs[0];
+        _selectedHistoryLog = log;
+        _selectedHistoryLogs = [log];
+        PopulateHistoryChangedFiles(log);
+        if (log.IsUncommitted)
+        {
+            ShowHistorySummary(
+                "Uncommitted changes" + Environment.NewLine +
+                Environment.NewLine +
+                string.Join(Environment.NewLine, log.ChangedFiles.Select(file => file.DisplayText)));
+            return;
+        }
+
+        ShowHistorySummary(
+            $"版本：r{log.Revision}{(log.IsWorkingCopyRevision ? "  [当前工作副本位置]" : "")}{Environment.NewLine}" +
+            $"作者：{log.Author}{Environment.NewLine}" +
+            $"时间：{log.LocalDateText}{Environment.NewLine}" +
+            Environment.NewLine +
+            log.Message +
+            Environment.NewLine +
+            Environment.NewLine +
+            $"Changed files ({log.ChangedFiles.Count})" +
+            Environment.NewLine +
+            string.Join(Environment.NewLine, log.ChangedFiles.Select(file => file.DisplayText)));
+    }
+
+    private void ShowSelectedHistoryRangeDetail(IReadOnlyList<SvnLogEntry> logs)
+    {
+        var committedLogs = logs.Where(log => !log.IsUncommitted).OrderBy(log => log.Revision).ToList();
+        if (committedLogs.Count == 0)
+        {
+            ShowHistorySummary("当前选择只包含未提交改动，请单选 Uncommitted changes 查看。");
+            _historyChangedFilesTree.Nodes.Clear();
+            return;
+        }
+
+        var changedFiles = BuildRangeChangedFiles(committedLogs);
+        PopulateHistoryChangedFiles($"Selected commits ({committedLogs.Count}) - Changed files ({changedFiles.Count})", changedFiles);
+        var first = committedLogs.First();
+        var last = committedLogs.Last();
+        ShowHistorySummary(
+            $"已选择 {committedLogs.Count} 条提交{Environment.NewLine}" +
+            $"范围：r{first.Revision} -> r{last.Revision}{Environment.NewLine}" +
+            $"时间：{first.LocalDateText} -> {last.LocalDateText}{Environment.NewLine}" +
+            $"改动文件：{changedFiles.Count}{Environment.NewLine}{Environment.NewLine}" +
+            string.Join(Environment.NewLine, committedLogs.OrderByDescending(log => log.Revision).Select(log =>
+                $"r{log.Revision}  {log.LocalDateText}  {log.Author}  {log.ShortMessage}")));
+    }
+
+    private void ShowHistorySummary(string text)
+    {
+        CancelHistoryDiffPreview();
+        _historyDiffPanel.Controls.Clear();
+        _historyDetailText.Text = text;
+        _historyDiffPanel.Controls.Add(_historyDetailText);
+    }
+
+    private void PopulateHistoryChangedFiles(SvnLogEntry log)
+    {
+        PopulateHistoryChangedFiles($"Changed files ({log.ChangedFiles.Count})", log.ChangedFiles);
+    }
+
+    private void PopulateHistoryChangedFiles(string rootText, IReadOnlyList<ChangedFileEntry> files)
+    {
+        _historyChangedFilesTree.BeginUpdate();
+        _historyChangedFilesTree.Nodes.Clear();
+        var root = new TreeNode(rootText)
+        {
+            ImageKey = "folder",
+            SelectedImageKey = "folder",
+        };
+        _historyChangedFilesTree.Nodes.Add(root);
+        foreach (var file in files)
+        {
+            AddChangedFileNode(root, file);
+        }
+
+        root.Expand();
+        _historyChangedFilesTree.EndUpdate();
+    }
+
+    private static IReadOnlyList<ChangedFileEntry> BuildRangeChangedFiles(IReadOnlyList<SvnLogEntry> logs)
+    {
+        return logs
+            .SelectMany(log => log.ChangedFiles)
+            .Where(file => !string.IsNullOrWhiteSpace(file.TreePath))
+            .GroupBy(file => file.TreePath, StringComparer.OrdinalIgnoreCase)
+            .Select(group =>
+            {
+                var files = group.ToList();
+                var action = files.All(file => file.Action == "A")
+                    ? "A"
+                    : files.All(file => file.Action == "D")
+                        ? "D"
+                        : "M";
+                var repositoryPath = files.LastOrDefault(file => !string.IsNullOrWhiteSpace(file.RepositoryPath))?.RepositoryPath ?? "";
+                var relativePath = files.LastOrDefault(file => !string.IsNullOrWhiteSpace(file.RelativePath))?.RelativePath ?? group.Key;
+                return new ChangedFileEntry(action, repositoryPath, relativePath);
+            })
+            .OrderBy(file => file.TreePath, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static void AddChangedFileNode(TreeNode root, ChangedFileEntry file)
+    {
+        var path = file.TreePath;
+        var parts = path.Split('/', '\\', StringSplitOptions.RemoveEmptyEntries);
+        var current = root;
+        for (var index = 0; index < parts.Length; index++)
+        {
+            var isFile = index == parts.Length - 1;
+            var text = isFile ? $"{file.Action} {parts[index]}" : parts[index];
+            var existing = current.Nodes.Cast<TreeNode>().FirstOrDefault(node => string.Equals(node.Text, text, StringComparison.OrdinalIgnoreCase));
+            if (existing == null)
+            {
+                existing = new TreeNode(text)
+                {
+                    Tag = isFile ? file : null,
+                    ToolTipText = file.DisplayText,
+                    ImageKey = isFile ? FileImageKey(file.TreePath, SvnStatusKind.None) : "folder",
+                    SelectedImageKey = isFile ? FileImageKey(file.TreePath, SvnStatusKind.None) : "folder",
+                };
+                if (isFile)
+                {
+                    existing.ForeColor = file.Action switch
+                    {
+                        "A" => Color.FromArgb(38, 128, 72),
+                        "D" => Color.FromArgb(170, 67, 67),
+                        "M" => Color.FromArgb(166, 103, 34),
+                        _ => SystemColors.WindowText,
+                    };
+                    if (file.Action is "A" or "D" or "M")
+                    {
+                        existing.ImageKey = "changed";
+                        existing.SelectedImageKey = "changed";
+                    }
+                }
+                else
+                {
+                    existing.ForeColor = Color.FromArgb(55, 65, 81);
+                    existing.NodeFont = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+                }
+                current.Nodes.Add(existing);
+            }
+
+            current = existing;
+        }
+        root.TreeView?.Sort();
+    }
+
+    private async Task ShowSelectedHistoryFileDiffAsync(TreeNode? node)
+    {
+        if (node?.Tag is not ChangedFileEntry file)
+        {
+            return;
+        }
+
+        var previewCts = BeginHistoryDiffPreview();
+        var token = previewCts.Token;
+        var extension = GetComparableExtension(file.TreePath);
+        var oldTemp = Path.Combine(Path.GetTempPath(), $"SVNManager_OLD_{Guid.NewGuid():N}{extension}");
+        var newTemp = Path.Combine(Path.GetTempPath(), $"SVNManager_NEW_{Guid.NewGuid():N}{extension}");
+        ShowHistoryDiffLoading(file.TreePath, "正在准备文件版本...");
+        SetBusy(true, "正在读取文件差异...");
+        try
+        {
+            var workingCopy = _workingCopyText.Text.Trim();
+            var title = "";
+            var cacheKey = "";
+            if (_selectedHistoryLogs.Count > 1)
+            {
+                var committedLogs = _selectedHistoryLogs.Where(log => !log.IsUncommitted).OrderBy(log => log.Revision).ToList();
+                if (committedLogs.Count == 0)
+                {
+                    ShowHistorySummary("多选范围不支持只选择未提交改动。");
+                    return;
+                }
+
+                var firstRevision = committedLogs.First().Revision;
+                var lastRevision = committedLogs.Last().Revision;
+                title = BuildDiffTitle(file.TreePath, $"r{firstRevision - 1}", $"r{lastRevision}", "选中提交范围");
+                cacheKey = BuildHistoryDiffCacheKey("range", file, firstRevision - 1, lastRevision);
+                if (TryRenderCachedHistoryDiff(title, cacheKey, token))
+                {
+                    return;
+                }
+
+                await PrepareRangeDiffFilesAsync(_svn, workingCopy, firstRevision, lastRevision, file, oldTemp, newTemp);
+                await ShowDiffPreviewAsync(title, oldTemp, newTemp, cacheKey, token);
+                return;
+            }
+
+            if (_selectedHistoryLog == null)
+            {
+                return;
+            }
+
+            if (_selectedHistoryLog.IsUncommitted && file.Action == "C")
+            {
+                var conflict = ConflictFileSet.Find(workingCopy, file.RelativePath);
+                if (conflict?.ServerPath != null)
+                {
+                    title = BuildDiffTitle(file.TreePath, "我的版本", "服务器版本", "SVN 冲突");
+                    cacheKey = BuildHistoryDiffCacheKey("conflict", file, 0, 0, FileVersionStamp(conflict.MinePath), FileVersionStamp(conflict.ServerPath));
+                    if (!TryRenderCachedHistoryDiff(title, cacheKey, token))
+                    {
+                        await ShowDiffPreviewAsync(title, conflict.MinePath, conflict.ServerPath, cacheKey, token);
+                    }
+
+                    return;
+                }
+            }
+
+            if (_selectedHistoryLog.IsUncommitted)
+            {
+                var localPath = Path.Combine(workingCopy, file.RelativePath);
+                title = BuildDiffTitle(file.TreePath, "SVN BASE", "本地工作副本", "未提交改动");
+                cacheKey = BuildHistoryDiffCacheKey("uncommitted", file, 0, 0, FileVersionStamp(localPath));
+                if (TryRenderCachedHistoryDiff(title, cacheKey, token))
+                {
+                    return;
+                }
+
+                await PrepareUncommittedDiffFilesAsync(workingCopy, file, oldTemp, newTemp);
+                await ShowDiffPreviewAsync(title, oldTemp, newTemp, cacheKey, token);
+            }
+            else
+            {
+                title = BuildDiffTitle(file.TreePath, $"r{_selectedHistoryLog.Revision - 1}", $"r{_selectedHistoryLog.Revision}", "单次提交");
+                cacheKey = BuildHistoryDiffCacheKey("commit", file, _selectedHistoryLog.Revision - 1, _selectedHistoryLog.Revision);
+                if (TryRenderCachedHistoryDiff(title, cacheKey, token))
+                {
+                    return;
+                }
+
+                await PrepareCommittedDiffFilesAsync(_svn, workingCopy, _selectedHistoryLog.Revision, file, oldTemp, newTemp);
+                await ShowDiffPreviewAsync(title, oldTemp, newTemp, cacheKey, token);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            if (!token.IsCancellationRequested)
+            {
+                ShowHistorySummary(ex.Message);
+            }
+        }
+        finally
+        {
+            TryDelete(oldTemp);
+            TryDelete(newTemp);
+            if (IsCurrentHistoryDiffPreview(previewCts))
+            {
+                SetBusy(false, "就绪");
+            }
+        }
+    }
+
+    private async Task PrepareUncommittedDiffFilesAsync(string workingCopy, ChangedFileEntry file, string oldTemp, string newTemp)
+    {
+        var localPath = Path.Combine(workingCopy, file.RelativePath);
+        if (file.Action is "A" or "?")
+        {
+            File.WriteAllText(oldTemp, "");
+            File.Copy(localPath, newTemp, true);
+            return;
+        }
+
+        if (file.Action is "D" or "!")
+        {
+            await _svn.WriteBaseFileAsync(workingCopy, file.RelativePath, oldTemp);
+            File.WriteAllText(newTemp, "");
+            return;
+        }
+
+        await _svn.WriteBaseFileAsync(workingCopy, file.RelativePath, oldTemp);
+        File.Copy(localPath, newTemp, true);
+    }
+
+    private CancellationTokenSource BeginHistoryDiffPreview()
+    {
+        CancelHistoryDiffPreview();
+        _historyDiffPreviewCts = new CancellationTokenSource();
+        return _historyDiffPreviewCts;
+    }
+
+    private void CancelHistoryDiffPreview()
+    {
+        try
+        {
+            _historyDiffPreviewCts?.Cancel();
+        }
+        catch
+        {
+        }
+    }
+
+    private void ClearHistoryDiffPreviewCache()
+    {
+        CancelHistoryDiffPreview();
+        _historyDiffPreviewCache.Clear();
+    }
+
+    private bool IsCurrentHistoryDiffPreview(CancellationTokenSource previewCts)
+    {
+        return ReferenceEquals(_historyDiffPreviewCts, previewCts);
+    }
+
+    private bool TryRenderCachedHistoryDiff(string title, string cacheKey, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        if (!_historyDiffPreviewCache.TryGetValue(cacheKey, out var data))
+        {
+            return false;
+        }
+
+        RenderDiffPreviewInPanel(_historyDiffPanel, null, title + "    [缓存]", data);
+        return true;
+    }
+
+    private async Task ShowDiffPreviewAsync(string title, string oldFilePath, string newFilePath, string cacheKey, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        ShowHistoryDiffLoading(title, "正在计算差异...");
+        var data = await Task.Run(() => CreateDiffPreviewData(oldFilePath, newFilePath), token);
+        token.ThrowIfCancellationRequested();
+        AddHistoryDiffPreviewCache(cacheKey, data);
+        RenderDiffPreviewInPanel(_historyDiffPanel, null, title, data);
+    }
+
+    private void AddHistoryDiffPreviewCache(string cacheKey, DiffPreviewData data)
+    {
+        if (string.IsNullOrWhiteSpace(cacheKey))
+        {
+            return;
+        }
+
+        if (_historyDiffPreviewCache.Count >= MaxDiffPreviewCacheEntries &&
+            !_historyDiffPreviewCache.ContainsKey(cacheKey))
+        {
+            _historyDiffPreviewCache.Remove(_historyDiffPreviewCache.Keys.First());
+        }
+
+        _historyDiffPreviewCache[cacheKey] = data;
+    }
+
+    private void ShowHistoryDiffLoading(string title, string message)
+    {
+        _historyDiffPanel.Controls.Clear();
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, title.Contains(Environment.NewLine, StringComparison.Ordinal) ? 46 : 28));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.Controls.Add(new Label
+        {
+            Text = title,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Padding = new Padding(6, 0, 0, 0),
+            BackColor = Color.FromArgb(248, 249, 250),
+        }, 0, 0);
+        root.Controls.Add(new Label
+        {
+            Text = message,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleCenter,
+            ForeColor = Color.FromArgb(85, 95, 105),
+        }, 0, 1);
+        _historyDiffPanel.Controls.Add(root);
+    }
+
+    private string BuildHistoryDiffCacheKey(string scope, ChangedFileEntry file, long oldRevision, long newRevision, params string[] stamps)
+    {
+        var workingCopy = _workingCopyText.Text.Trim();
+        var repository = _repoUrlText.Text.Trim();
+        return string.Join("|",
+            "history",
+            scope,
+            repository,
+            workingCopy,
+            oldRevision.ToString(),
+            newRevision.ToString(),
+            file.Action,
+            file.RepositoryPath,
+            file.RelativePath,
+            file.TreePath,
+            string.Join(";", stamps));
+    }
+
+    private static string FileVersionStamp(string path)
+    {
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return $"{path}:missing";
+            }
+
+            var info = new FileInfo(path);
+            return $"{path}:{info.Length}:{info.LastWriteTimeUtc.Ticks}";
+        }
+        catch
+        {
+            return $"{path}:unknown";
+        }
+    }
+
+    internal static async Task PrepareCommittedDiffFilesAsync(SvnClient svn, string workingCopy, long revision, ChangedFileEntry file, string oldTemp, string newTemp)
+    {
+        if (file.Action == "A")
+        {
+            File.WriteAllText(oldTemp, "");
+            await svn.WriteRepositoryFileAtRevisionAsync(workingCopy, file.RepositoryPath, revision, newTemp);
+            return;
+        }
+
+        if (file.Action == "D")
+        {
+            await svn.WriteRepositoryFileAtRevisionAsync(workingCopy, file.RepositoryPath, revision - 1, oldTemp);
+            File.WriteAllText(newTemp, "");
+            return;
+        }
+
+        await svn.WriteRepositoryFileAtRevisionAsync(workingCopy, file.RepositoryPath, revision - 1, oldTemp);
+        await svn.WriteRepositoryFileAtRevisionAsync(workingCopy, file.RepositoryPath, revision, newTemp);
+    }
+
+    internal static async Task PrepareRangeDiffFilesAsync(
+        SvnClient svn,
+        string workingCopy,
+        long firstRevision,
+        long lastRevision,
+        ChangedFileEntry file,
+        string oldTemp,
+        string newTemp)
+    {
+        await TryWriteRepositoryFileAtRevisionAsync(svn, workingCopy, file.RepositoryPath, firstRevision - 1, oldTemp);
+        await TryWriteRepositoryFileAtRevisionAsync(svn, workingCopy, file.RepositoryPath, lastRevision, newTemp);
+    }
+
+    private static async Task TryWriteRepositoryFileAtRevisionAsync(SvnClient svn, string workingCopy, string repositoryPath, long revision, string outputPath)
+    {
+        try
+        {
+            await svn.WriteRepositoryFileAtRevisionAsync(workingCopy, repositoryPath, revision, outputPath);
+        }
+        catch
+        {
+            File.WriteAllText(outputPath, "");
+        }
+    }
+
+    internal static void ShowDiffPreviewInPanel(Panel panel, Label? headerLabel, string title, string oldFilePath, string newFilePath)
+    {
+        RenderDiffPreviewInPanel(panel, headerLabel, title, CreateDiffPreviewData(oldFilePath, newFilePath));
+    }
+
+    internal static DiffPreviewData CreateDiffPreviewData(string oldFilePath, string newFilePath)
+    {
+        if (DiffFileKindDetector.IsSpreadsheet(oldFilePath) && DiffFileKindDetector.IsSpreadsheet(newFilePath))
+        {
+            return DiffPreviewData.FromExcel(ExcelDiffService.Compare(oldFilePath, newFilePath));
+        }
+
+        return DiffPreviewData.FromText(TextDiffService.Compare(oldFilePath, newFilePath));
+    }
+
+    internal static void RenderDiffPreviewInPanel(Panel panel, Label? headerLabel, string title, DiffPreviewData data)
+    {
+        panel.Controls.Clear();
+        var header = headerLabel ?? new Label
+        {
+            Text = title,
+            Dock = DockStyle.Top,
+            Height = title.Contains(Environment.NewLine, StringComparison.Ordinal) ? 46 : 28,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Padding = new Padding(6, 0, 0, 0),
+            BackColor = Color.FromArgb(248, 249, 250),
+        };
+        header.Text = title;
+        panel.Controls.Add(header);
+
+        var diffControl = data.CreateView();
+        diffControl.Dock = DockStyle.Fill;
+        panel.Controls.Add(diffControl);
+        diffControl.BringToFront();
+    }
+
+    private void ShowDiffPreview(string title, string oldFilePath, string newFilePath)
+    {
+        ShowDiffPreviewInPanel(_historyDiffPanel, null, title, oldFilePath, newFilePath);
+    }
+
+    private static string BuildDiffTitle(string path, string oldLabel, string newLabel, string scope)
+    {
+        return $"{path}{Environment.NewLine}{scope}: {oldLabel} -> {newLabel}";
+    }
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
+            // Temp cleanup failure should not block normal use.
+        }
+    }
+}
+
+internal sealed class DiffPreviewData
+{
+    private DiffPreviewData(IReadOnlyList<ExcelCellDifference>? excelDifferences, IReadOnlyList<TextDiffRow>? textDifferences)
+    {
+        ExcelDifferences = excelDifferences;
+        TextDifferences = textDifferences;
+    }
+
+    public IReadOnlyList<ExcelCellDifference>? ExcelDifferences { get; }
+    public IReadOnlyList<TextDiffRow>? TextDifferences { get; }
+
+    public static DiffPreviewData FromExcel(IReadOnlyList<ExcelCellDifference> differences)
+    {
+        return new DiffPreviewData(differences.ToList(), null);
+    }
+
+    public static DiffPreviewData FromText(IReadOnlyList<TextDiffRow> differences)
+    {
+        return new DiffPreviewData(null, differences.ToList());
+    }
+
+    public Control CreateView()
+    {
+        return ExcelDifferences != null
+            ? ExcelDiffForm.CreateExcelDiffView(ExcelDifferences)
+            : TextDiffForm.CreateTextDiffView(TextDifferences ?? []);
+    }
+}
+
+internal sealed class SvnClient
+{
+    public Task<ProcessResult> CheckoutAsync(string repositoryUrl, string workingCopyPath)
+    {
+        return RunAsync(null, "checkout", repositoryUrl, workingCopyPath);
+    }
+
+    public Task<ProcessResult> UpdateAsync(string workingCopyPath)
+    {
+        return RunAsync(workingCopyPath, "update");
+    }
+
+    public Task<ProcessResult> UpdateToRevisionAsync(string workingCopyPath, long revision)
+    {
+        return RunAsync(workingCopyPath, "update", "-r", revision.ToString());
+    }
+
+    public Task<ProcessResult> AddAsync(string workingCopyPath, string relativePath)
+    {
+        return RunAsync(workingCopyPath, "add", relativePath);
+    }
+
+    public Task<ProcessResult> ResolveAsync(string workingCopyPath, string relativePath)
+    {
+        return RunAsync(workingCopyPath, "resolve", "--accept", "working", relativePath);
+    }
+
+    public Task<ProcessResult> CommitAsync(string workingCopyPath, IEnumerable<string> relativePaths, string message)
+    {
+        var args = new List<string> { "commit", "-m", message };
+        args.AddRange(relativePaths);
+        return RunAsync(workingCopyPath, args.ToArray());
+    }
+
+    public async Task WriteBaseFileAsync(string workingCopyPath, string relativePath, string outputPath)
+    {
+        var result = await RunBinaryToFileAsync(workingCopyPath, outputPath, "cat", "-r", "BASE", relativePath);
+        if (result.ExitCode != 0)
+        {
+            throw new InvalidOperationException(result.CombinedOutput);
+        }
+    }
+
+    public async Task WriteRepositoryFileAtRevisionAsync(string workingCopyPath, string repositoryPath, long revision, string outputPath)
+    {
+        var path = repositoryPath.StartsWith("^", StringComparison.Ordinal) ? repositoryPath : "^" + repositoryPath;
+        var result = await RunBinaryToFileAsync(workingCopyPath, outputPath, "cat", "-r", revision.ToString(), path);
+        if (result.ExitCode != 0)
+        {
+            throw new InvalidOperationException(result.CombinedOutput);
+        }
+    }
+
+    public async Task<IReadOnlyList<SvnChange>> GetStatusAsync(string workingCopyPath)
+    {
+        return await Task.Run(() => GetStatus(workingCopyPath));
+    }
+
+    public IReadOnlyList<SvnChange> GetStatus(string workingCopyPath)
+    {
+        var result = RunText(workingCopyPath, "status");
+        if (result.ExitCode != 0)
+        {
+            throw new InvalidOperationException(result.CombinedOutput);
+        }
+
+        if (string.IsNullOrWhiteSpace(result.StandardOutput))
+        {
+            return Array.Empty<SvnChange>();
+        }
+
+        return result.StandardOutput
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(ParseStatusLine)
+            .Where(change => change != null)
+            .Cast<SvnChange>()
+            .Where(change => !SvnConflictArtifact.IsAuxiliaryPath(change.RelativePath))
+            .OrderBy(change => change.RelativePath)
+            .ToList();
+    }
+
+    public WorkingCopyInfo GetWorkingCopyInfo(string workingCopyPath)
+    {
+        var result = RunText(workingCopyPath, "info");
+        if (result.ExitCode != 0 || string.IsNullOrWhiteSpace(result.StandardOutput))
+        {
+            return WorkingCopyInfo.Empty;
+        }
+
+        var values = result.StandardOutput
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line.Split(':', 2))
+            .Where(parts => parts.Length == 2)
+            .ToDictionary(parts => parts[0].Trim(), parts => parts[1].Trim(), StringComparer.OrdinalIgnoreCase);
+
+        var revision = values.TryGetValue("Revision", out var revisionText) && long.TryParse(revisionText, out var rev) ? rev : 0;
+        var lastChangedRevision = values.TryGetValue("Last Changed Rev", out var lastChangedText) && long.TryParse(lastChangedText, out var lastChangedRev)
+            ? lastChangedRev
+            : revision;
+        var url = values.TryGetValue("URL", out var urlText) ? urlText : "";
+        var maxRevision = Math.Max(revision, lastChangedRevision);
+        var minRevision = revision;
+        try
+        {
+            var versionResult = RunToolText("svnversion", null, workingCopyPath);
+            if (versionResult.ExitCode == 0 && !string.IsNullOrWhiteSpace(versionResult.StandardOutput))
+            {
+                var version = ParseSvnVersion(versionResult.StandardOutput);
+                if (version.MaxRevision > 0)
+                {
+                    minRevision = version.MinRevision;
+                    maxRevision = version.MaxRevision;
+                }
+            }
+        }
+        catch
+        {
+            // svnversion is optional; root svn info is still usable as a fallback.
+        }
+
+        return new WorkingCopyInfo(revision, lastChangedRevision, minRevision, maxRevision, url);
+    }
+
+    private static SvnChange? ParseStatusLine(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return null;
+        }
+
+        var status = line[0];
+        if (MapTextStatus(status) == SvnStatusKind.None || !LooksLikeStatusLine(line))
+        {
+            return null;
+        }
+
+        var path = line.Length > 8 ? line[8..].Trim() : line[1..].Trim();
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return null;
+        }
+
+        return new SvnChange(path, MapTextStatus(status));
+    }
+
+    private static bool LooksLikeStatusLine(string line)
+    {
+        if (line.Length < 2)
+        {
+            return false;
+        }
+
+        return line.Length > 7 && char.IsWhiteSpace(line[7]) || line.Length > 1 && char.IsWhiteSpace(line[1]);
+    }
+
+    private static (long MinRevision, long MaxRevision) ParseSvnVersion(string text)
+    {
+        var revisions = System.Text.RegularExpressions.Regex.Matches(text, @"\d+")
+            .Select(match => long.TryParse(match.Value, out var revision) ? revision : 0)
+            .Where(revision => revision > 0)
+            .ToList();
+        if (revisions.Count == 0)
+        {
+            return (0, 0);
+        }
+
+        return (revisions.Min(), revisions.Max());
+    }
+
+    public async Task<IReadOnlyList<SvnLogEntry>> GetLogAsync(string workingCopyPath, string relativePath, int limit)
+    {
+        return await GetLogAsync(workingCopyPath, [relativePath], limit);
+    }
+
+    public async Task<IReadOnlyList<SvnLogEntry>> GetLogAsync(string workingCopyPath, IReadOnlyList<string> relativePaths, int limit)
+    {
+        var targets = relativePaths
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (targets.Count == 0)
+        {
+            return Array.Empty<SvnLogEntry>();
+        }
+
+        if (targets.Count == 1)
+        {
+            return await GetLogForSingleTargetAsync(workingCopyPath, targets[0], limit);
+        }
+
+        var allLogs = new List<SvnLogEntry>();
+        foreach (var target in targets)
+        {
+            allLogs.AddRange(await GetLogForSingleTargetAsync(workingCopyPath, target, limit));
+        }
+
+        return MergeLogEntries(allLogs)
+            .OrderByDescending(log => log.Revision)
+            .Take(limit)
+            .ToList();
+    }
+
+    private async Task<IReadOnlyList<SvnLogEntry>> GetLogForSingleTargetAsync(string workingCopyPath, string relativePath, int limit)
+    {
+        var args = new List<string> { "log", "-v", "--limit", limit.ToString() };
+        args.Add(relativePath);
+        var result = await RunTextAsync(workingCopyPath, args.ToArray());
+        if (result.ExitCode != 0)
+        {
+            throw new InvalidOperationException(result.CombinedOutput);
+        }
+
+        if (string.IsNullOrWhiteSpace(result.StandardOutput))
+        {
+            return Array.Empty<SvnLogEntry>();
+        }
+
+        return ParseTextLogEntries(result.StandardOutput);
+    }
+
+    private static IReadOnlyList<SvnLogEntry> MergeLogEntries(IEnumerable<SvnLogEntry> logs)
+    {
+        return logs
+            .GroupBy(log => log.Revision)
+            .Select(group =>
+            {
+                var first = group.OrderByDescending(log => log.ChangedFiles.Count).First();
+                var changedFiles = group
+                    .SelectMany(log => log.ChangedFiles)
+                    .GroupBy(file => $"{file.Action}|{file.RepositoryPath}|{file.RelativePath}", StringComparer.OrdinalIgnoreCase)
+                    .Select(fileGroup => fileGroup.First())
+                    .OrderBy(file => file.TreePath, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                return first with { ChangedFiles = changedFiles };
+            })
+            .ToList();
+    }
+
+    public async Task<IReadOnlyList<SvnLogEntry>> GetRepositoryLogAsync(string workingCopyPath, int limit)
+    {
+        var result = await RunTextAsync(workingCopyPath, "log", "-v", "--limit", limit.ToString());
+        if (result.ExitCode != 0)
+        {
+            throw new InvalidOperationException(result.CombinedOutput);
+        }
+
+        if (string.IsNullOrWhiteSpace(result.StandardOutput))
+        {
+            return Array.Empty<SvnLogEntry>();
+        }
+
+        return ParseTextLogEntries(result.StandardOutput);
+    }
+
+    public async Task<SvnLogEntry?> GetLatestRepositoryLogAsync(string workingCopyPath)
+    {
+        var logs = await GetRepositoryLogAsync(workingCopyPath, 1);
+        return logs.FirstOrDefault();
+    }
+
+    private static IReadOnlyList<SvnLogEntry> ParseTextLogEntries(string text)
+    {
+        var entries = new List<SvnLogEntry>();
+        var blocks = text.Split("------------------------------------------------------------------------", StringSplitOptions.RemoveEmptyEntries);
+        foreach (var rawBlock in blocks)
+        {
+            var lines = rawBlock
+                .Replace("\r\n", "\n", StringComparison.Ordinal)
+                .Split('\n')
+                .Select(line => line.TrimEnd())
+                .ToList();
+            var headerIndex = lines.FindIndex(line => line.StartsWith("r", StringComparison.Ordinal) && line.Contains('|'));
+            if (headerIndex < 0)
+            {
+                continue;
+            }
+
+            var parts = lines[headerIndex].Split('|').Select(part => part.Trim()).ToArray();
+            if (parts.Length < 3)
+            {
+                continue;
+            }
+
+            var revision = long.TryParse(parts[0].TrimStart('r'), out var revisionValue) ? revisionValue : 0;
+            var author = parts[1];
+            var date = ParseSvnTextDate(parts[2]);
+            var changedFiles = new List<ChangedFileEntry>();
+            var cursor = headerIndex + 1;
+            while (cursor < lines.Count && string.IsNullOrWhiteSpace(lines[cursor]))
+            {
+                cursor++;
+            }
+
+            if (cursor < lines.Count && string.Equals(lines[cursor].Trim(), "Changed paths:", StringComparison.OrdinalIgnoreCase))
+            {
+                cursor++;
+                while (cursor < lines.Count && !string.IsNullOrWhiteSpace(lines[cursor]))
+                {
+                    changedFiles.Add(ChangedFileEntry.ParseRepositoryPath(lines[cursor].Trim()));
+                    cursor++;
+                }
+            }
+
+            var messageLines = lines.Skip(cursor).SkipWhile(string.IsNullOrWhiteSpace).ToList();
+            entries.Add(new SvnLogEntry(revision, author, date, string.Join(Environment.NewLine, messageLines).Trim())
+            {
+                ChangedFiles = changedFiles,
+            });
+        }
+
+        return entries;
+    }
+
+    private static DateTimeOffset ParseSvnTextDate(string text)
+    {
+        var datePart = text.Split('(')[0].Trim();
+        return DateTimeOffset.TryParse(datePart, out var date) ? date : DateTimeOffset.MinValue;
+    }
+
+    private static SvnStatusKind MapStatus(string status)
+    {
+        return status switch
+        {
+            "modified" => SvnStatusKind.Modified,
+            "added" => SvnStatusKind.Added,
+            "deleted" => SvnStatusKind.Deleted,
+            "unversioned" => SvnStatusKind.Unversioned,
+            "missing" => SvnStatusKind.Missing,
+            "conflicted" => SvnStatusKind.Conflicted,
+            "replaced" => SvnStatusKind.Replaced,
+            "normal" => SvnStatusKind.Normal,
+            _ => SvnStatusKind.None,
+        };
+    }
+
+    private static SvnStatusKind MapTextStatus(char status)
+    {
+        return status switch
+        {
+            'M' => SvnStatusKind.Modified,
+            'A' => SvnStatusKind.Added,
+            'D' => SvnStatusKind.Deleted,
+            '?' => SvnStatusKind.Unversioned,
+            '!' => SvnStatusKind.Missing,
+            'C' => SvnStatusKind.Conflicted,
+            'R' => SvnStatusKind.Replaced,
+            _ => SvnStatusKind.None,
+        };
+    }
+
+    private static async Task<ProcessResult> RunAsync(string? workingDirectory, params string[] arguments)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "svn",
+            WorkingDirectory = string.IsNullOrWhiteSpace(workingDirectory) ? Environment.CurrentDirectory : workingDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+
+        foreach (var argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("无法启动 svn 命令。");
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        var stdout = await stdoutTask;
+        var stderr = await stderrTask;
+        return new ProcessResult(process.ExitCode, stdout, stderr);
+    }
+
+    private static async Task<ProcessResult> RunTextAsync(string? workingDirectory, params string[] arguments)
+    {
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        var textEncoding = Encoding.GetEncoding("GB18030");
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "svn",
+            WorkingDirectory = string.IsNullOrWhiteSpace(workingDirectory) ? Environment.CurrentDirectory : workingDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = textEncoding,
+            StandardErrorEncoding = textEncoding,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+
+        foreach (var argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("无法启动 svn 命令。");
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        var stdout = await stdoutTask;
+        var stderr = await stderrTask;
+        return new ProcessResult(process.ExitCode, stdout, stderr);
+    }
+
+    private static ProcessResult RunText(string? workingDirectory, params string[] arguments)
+    {
+        return RunToolText("svn", workingDirectory, arguments);
+    }
+
+    private static ProcessResult RunToolText(string fileName, string? workingDirectory, params string[] arguments)
+    {
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        var textEncoding = Encoding.GetEncoding("GB18030");
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = fileName,
+            WorkingDirectory = string.IsNullOrWhiteSpace(workingDirectory) ? Environment.CurrentDirectory : workingDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = textEncoding,
+            StandardErrorEncoding = textEncoding,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+
+        foreach (var argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("无法启动 svn 命令。");
+        var stdout = process.StandardOutput.ReadToEnd();
+        var stderr = process.StandardError.ReadToEnd();
+        process.WaitForExit();
+        return new ProcessResult(process.ExitCode, stdout, stderr);
+    }
+
+    private static async Task<ProcessResult> RunBinaryToFileAsync(string? workingDirectory, string outputPath, params string[] arguments)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "svn",
+            WorkingDirectory = string.IsNullOrWhiteSpace(workingDirectory) ? Environment.CurrentDirectory : workingDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+
+        foreach (var argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("无法启动 svn 命令。");
+        await using var output = File.Create(outputPath);
+        var copyTask = process.StandardOutput.BaseStream.CopyToAsync(output);
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        await copyTask;
+        var stderr = await stderrTask;
+        return new ProcessResult(process.ExitCode, "", stderr);
+    }
+}
+
+internal static class ExcelDiffService
+{
+    public static IReadOnlyList<ExcelCellDifference> Compare(string oldFilePath, string newFilePath)
+    {
+        if (IsXmlSpreadsheet(oldFilePath) || IsXmlSpreadsheet(newFilePath))
+        {
+            return CompareXmlSpreadsheet(oldFilePath, newFilePath);
+        }
+
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+
+        using var oldStream = File.OpenRead(oldFilePath);
+        using var newStream = File.OpenRead(newFilePath);
+        var oldWorkbook = WorkbookFactory.Create(oldStream);
+        var newWorkbook = WorkbookFactory.Create(newStream);
+
+        var oldCells = ReadCells(oldWorkbook);
+        var newCells = ReadCells(newWorkbook);
+        var keys = oldCells.Keys
+            .Union(newCells.Keys)
+            .OrderBy(key => key.Sheet)
+            .ThenBy(key => key.Row)
+            .ThenBy(key => key.Column);
+        var differences = new List<ExcelCellDifference>();
+
+        foreach (var key in keys)
+        {
+            oldCells.TryGetValue(key, out var oldValue);
+            newCells.TryGetValue(key, out var newValue);
+            oldValue ??= "";
+            newValue ??= "";
+            if (!string.Equals(oldValue, newValue, StringComparison.Ordinal))
+            {
+                differences.Add(CreateDifference(key, oldCells, newCells, oldValue, newValue));
+            }
+        }
+
+        return differences;
+    }
+
+    private static IReadOnlyList<ExcelCellDifference> CompareXmlSpreadsheet(string oldFilePath, string newFilePath)
+    {
+        var oldCells = ReadXmlSpreadsheetCells(oldFilePath);
+        var newCells = ReadXmlSpreadsheetCells(newFilePath);
+        var keys = oldCells.Keys
+            .Union(newCells.Keys)
+            .OrderBy(key => key.Sheet)
+            .ThenBy(key => key.Row)
+            .ThenBy(key => key.Column);
+        var differences = new List<ExcelCellDifference>();
+
+        foreach (var key in keys)
+        {
+            oldCells.TryGetValue(key, out var oldValue);
+            newCells.TryGetValue(key, out var newValue);
+            oldValue ??= "";
+            newValue ??= "";
+            if (!string.Equals(oldValue, newValue, StringComparison.Ordinal))
+            {
+                differences.Add(CreateDifference(key, oldCells, newCells, oldValue, newValue));
+            }
+        }
+
+        return differences;
+    }
+
+    private static ExcelCellDifference CreateDifference(
+        ExcelCellKey key,
+        Dictionary<ExcelCellKey, string> oldCells,
+        Dictionary<ExcelCellKey, string> newCells,
+        string oldValue,
+        string newValue)
+    {
+        var fieldName = FirstNonEmpty(
+            GetCellValue(newCells, key.Sheet, 1, key.Column),
+            GetCellValue(oldCells, key.Sheet, 1, key.Column));
+        var rowId = FirstNonEmpty(
+            GetCellValue(newCells, key.Sheet, key.Row, 0),
+            GetCellValue(oldCells, key.Sheet, key.Row, 0));
+        return new ExcelCellDifference(
+            key.Sheet,
+            key.Row + 1,
+            key.Column + 1,
+            ToColumnName(key.Column),
+            fieldName,
+            rowId,
+            oldValue,
+            newValue);
+    }
+
+    private static string GetCellValue(Dictionary<ExcelCellKey, string> cells, string sheet, int row, int column)
+    {
+        return cells.TryGetValue(new ExcelCellKey(sheet, row, column), out var value) ? value : "";
+    }
+
+    private static string FirstNonEmpty(params string[] values)
+    {
+        return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? "";
+    }
+
+    private static bool IsXmlSpreadsheet(string filePath)
+    {
+        var comparablePath = SvnConflictArtifact.NormalizeToBasePath(filePath);
+        if (!string.Equals(Path.GetExtension(comparablePath), ".xml", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var stream = File.OpenRead(filePath);
+            var document = XDocument.Load(stream, LoadOptions.None);
+            return document.Root?.Name.LocalName == "Workbook" &&
+                document.Root.Name.NamespaceName == "urn:schemas-microsoft-com:office:spreadsheet";
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static Dictionary<ExcelCellKey, string> ReadXmlSpreadsheetCells(string filePath)
+    {
+        var document = XDocument.Load(filePath, LoadOptions.PreserveWhitespace);
+        XNamespace spreadsheet = "urn:schemas-microsoft-com:office:spreadsheet";
+        var cells = new Dictionary<ExcelCellKey, string>();
+
+        foreach (var worksheet in document.Root?.Elements(spreadsheet + "Worksheet") ?? Enumerable.Empty<XElement>())
+        {
+            var sheetName = worksheet.Attribute(spreadsheet + "Name")?.Value ?? "Sheet";
+            var table = worksheet.Element(spreadsheet + "Table");
+            if (table == null)
+            {
+                continue;
+            }
+
+            var rowIndex = 0;
+            foreach (var row in table.Elements(spreadsheet + "Row"))
+            {
+                var explicitRowIndex = GetSpreadsheetIndex(row, spreadsheet);
+                if (explicitRowIndex.HasValue)
+                {
+                    rowIndex = explicitRowIndex.Value - 1;
+                }
+
+                var columnIndex = 0;
+                foreach (var cell in row.Elements(spreadsheet + "Cell"))
+                {
+                    var explicitColumnIndex = GetSpreadsheetIndex(cell, spreadsheet);
+                    if (explicitColumnIndex.HasValue)
+                    {
+                        columnIndex = explicitColumnIndex.Value - 1;
+                    }
+
+                    var data = cell.Elements().FirstOrDefault(element => element.Name.LocalName == "Data");
+                    var value = NormalizeCellText(data?.Value ?? "");
+                    if (!string.IsNullOrEmpty(value))
+                    {
+                        cells[new ExcelCellKey(sheetName, rowIndex, columnIndex)] = value;
+                    }
+
+                    columnIndex++;
+                }
+
+                rowIndex++;
+            }
+        }
+
+        return cells;
+    }
+
+    private static int? GetSpreadsheetIndex(XElement element, XNamespace spreadsheet)
+    {
+        var value = element.Attribute(spreadsheet + "Index")?.Value;
+        return int.TryParse(value, out var index) ? index : null;
+    }
+
+    private static string NormalizeCellText(string value)
+    {
+        return value
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n')
+            .Trim();
+    }
+
+    private static Dictionary<ExcelCellKey, string> ReadCells(IWorkbook workbook)
+    {
+        var formatter = new DataFormatter();
+        var cells = new Dictionary<ExcelCellKey, string>();
+        for (var sheetIndex = 0; sheetIndex < workbook.NumberOfSheets; sheetIndex++)
+        {
+            var sheet = workbook.GetSheetAt(sheetIndex);
+            if (sheet == null)
+            {
+                continue;
+            }
+
+            for (var rowIndex = sheet.FirstRowNum; rowIndex <= sheet.LastRowNum; rowIndex++)
+            {
+                var row = sheet.GetRow(rowIndex);
+                if (row == null)
+                {
+                    continue;
+                }
+
+                for (var columnIndex = row.FirstCellNum; columnIndex < row.LastCellNum; columnIndex++)
+                {
+                    if (columnIndex < 0)
+                    {
+                        continue;
+                    }
+
+                    var cell = row.GetCell(columnIndex);
+                    var value = cell == null ? "" : formatter.FormatCellValue(cell).Trim();
+                    if (!string.IsNullOrEmpty(value))
+                    {
+                        cells[new ExcelCellKey(sheet.SheetName, rowIndex, columnIndex)] = value;
+                    }
+                }
+            }
+        }
+
+        return cells;
+    }
+
+    private static string ToColumnName(int zeroBasedColumn)
+    {
+        var column = zeroBasedColumn + 1;
+        var name = "";
+        while (column > 0)
+        {
+            var modulo = (column - 1) % 26;
+            name = Convert.ToChar('A' + modulo) + name;
+            column = (column - modulo) / 26;
+        }
+
+        return name;
+    }
+}
+
+internal sealed class ExcelDiffForm : Form
+{
+    public ExcelDiffForm(string relativePath, IReadOnlyList<ExcelCellDifference> differences)
+    {
+        Text = $"Excel 差异 - {relativePath}";
+        StartPosition = FormStartPosition.CenterParent;
+        MinimumSize = new Size(980, 560);
+        Size = new Size(1120, 680);
+        Font = new Font("Microsoft YaHei UI", 9F);
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            RowCount = 2,
+            ColumnCount = 1,
+            Padding = new Padding(12),
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        Controls.Add(root);
+
+        root.Controls.Add(new Label
+        {
+            Text = differences.Count == 0 ? "没有发现单元格差异" : $"发现 {differences.Count} 个单元格差异",
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+        }, 0, 0);
+
+        root.Controls.Add(CreateExcelDiffView(differences), 0, 1);
+    }
+
+    public static Control CreateExcelDiffView(IReadOnlyList<ExcelCellDifference> differences)
+    {
+        var rows = differences.ToList();
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            RowCount = 2,
+            ColumnCount = 1,
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        var toolbar = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 5,
+            RowCount = 1,
+            BackColor = Color.FromArgb(248, 249, 250),
+        };
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 130));
+
+        var searchBox = new TextBox { Dock = DockStyle.Fill, PlaceholderText = "搜索 ID / 字段 / 新旧值 / 单元格", Margin = new Padding(0, 4, 8, 4) };
+        var idBox = new TextBox { Dock = DockStyle.Fill, PlaceholderText = "只看 ID", Margin = new Padding(0, 4, 8, 4) };
+        var fieldBox = new TextBox { Dock = DockStyle.Fill, PlaceholderText = "只看字段", Margin = new Padding(0, 4, 8, 4) };
+        var clearButton = new Button { Text = "清空", Dock = DockStyle.Fill, Margin = new Padding(0, 3, 8, 3) };
+        var countLabel = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft };
+        toolbar.Controls.Add(searchBox, 0, 0);
+        toolbar.Controls.Add(idBox, 1, 0);
+        toolbar.Controls.Add(fieldBox, 2, 0);
+        toolbar.Controls.Add(clearButton, 3, 0);
+        toolbar.Controls.Add(countLabel, 4, 0);
+        root.Controls.Add(toolbar, 0, 0);
+
+        var grid = CreateExcelDiffGrid();
+        root.Controls.Add(grid, 0, 1);
+
+        void ApplyFilter()
+        {
+            var keyword = searchBox.Text.Trim();
+            var id = idBox.Text.Trim();
+            var field = fieldBox.Text.Trim();
+            var filtered = rows.Where(row =>
+                    (string.IsNullOrWhiteSpace(keyword) ||
+                        row.Sheet.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                        row.Address.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                        row.FieldName.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                        row.RowId.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                        row.OldValue.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                        row.NewValue.Contains(keyword, StringComparison.OrdinalIgnoreCase)) &&
+                    (string.IsNullOrWhiteSpace(id) || row.RowId.Contains(id, StringComparison.OrdinalIgnoreCase)) &&
+                    (string.IsNullOrWhiteSpace(field) || row.FieldName.Contains(field, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+            grid.DataSource = filtered;
+            countLabel.Text = $"{filtered.Count} / {rows.Count} 项";
+        }
+
+        searchBox.TextChanged += (_, _) => ApplyFilter();
+        idBox.TextChanged += (_, _) => ApplyFilter();
+        fieldBox.TextChanged += (_, _) => ApplyFilter();
+        clearButton.Click += (_, _) =>
+        {
+            searchBox.Clear();
+            idBox.Clear();
+            fieldBox.Clear();
+        };
+        ApplyFilter();
+        return root;
+    }
+
+    public static DataGridView CreateExcelDiffGrid()
+    {
+        var grid = new DataGridView
+        {
+            Dock = DockStyle.Fill,
+            AllowUserToAddRows = false,
+            AllowUserToDeleteRows = false,
+            AutoGenerateColumns = false,
+            ReadOnly = true,
+            RowHeadersVisible = false,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+        };
+
+        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "工作表", DataPropertyName = nameof(ExcelCellDifference.Sheet), Width = 160 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "单元格", DataPropertyName = nameof(ExcelCellDifference.Address), Width = 90 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "字段", DataPropertyName = nameof(ExcelCellDifference.FieldName), Width = 170 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "ID", DataPropertyName = nameof(ExcelCellDifference.RowId), Width = 130 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "旧值", DataPropertyName = nameof(ExcelCellDifference.OldValue), Width = 320 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "新值", DataPropertyName = nameof(ExcelCellDifference.NewValue), Width = 320 });
+        return grid;
+    }
+}
+
+internal sealed record ExcelCellKey(string Sheet, int Row, int Column);
+
+internal sealed record ExcelCellDifference(string Sheet, int Row, int Column, string ColumnName, string FieldName, string RowId, string OldValue, string NewValue)
+{
+    public string Address => $"{ColumnName}{Row}";
+}
+
+internal static class SvnConflictArtifact
+{
+    public static bool IsAuxiliaryPath(string path)
+    {
+        var fileName = Path.GetFileName(path);
+        return fileName.EndsWith(".mine", StringComparison.OrdinalIgnoreCase) ||
+            System.Text.RegularExpressions.Regex.IsMatch(fileName, @"\.r\d+$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+    }
+
+    public static string NormalizeToBasePath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return path;
+        }
+
+        if (path.EndsWith(".mine", StringComparison.OrdinalIgnoreCase))
+        {
+            return path[..^5];
+        }
+
+        var fileName = Path.GetFileName(path);
+        var match = System.Text.RegularExpressions.Regex.Match(fileName, @"\.r\d+$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        return match.Success ? path[..^match.Value.Length] : path;
+    }
+}
+
+internal static class DiffFileKindDetector
+{
+    public static bool IsSpreadsheet(string filePath)
+    {
+        var comparablePath = SvnConflictArtifact.NormalizeToBasePath(filePath);
+        var extension = Path.GetExtension(comparablePath);
+        if (string.Equals(extension, ".xls", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(extension, ".xlsx", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (!string.Equals(extension, ".xml", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var stream = File.OpenRead(filePath);
+            var document = XDocument.Load(stream, LoadOptions.None);
+            return document.Root?.Name.LocalName == "Workbook" &&
+                document.Root.Name.NamespaceName == "urn:schemas-microsoft-com:office:spreadsheet";
+        }
+        catch
+        {
+            return false;
+        }
+    }
+}
+
+internal static class TextDiffService
+{
+    public static IReadOnlyList<TextDiffRow> Compare(string oldFilePath, string newFilePath)
+    {
+        var oldLines = ReadTextLines(oldFilePath);
+        var newLines = ReadTextLines(newFilePath);
+        var operations = (long)oldLines.Length * newLines.Length <= 2_000_000
+            ? BuildAlignedOperations(oldLines, newLines)
+            : BuildPositionalOperations(oldLines, newLines);
+        return BuildHunks(operations);
+    }
+
+    private static List<TextDiffOperation> BuildAlignedOperations(string[] oldLines, string[] newLines)
+    {
+        var table = new int[oldLines.Length + 1, newLines.Length + 1];
+        for (var oldIndex = oldLines.Length - 1; oldIndex >= 0; oldIndex--)
+        {
+            for (var newIndex = newLines.Length - 1; newIndex >= 0; newIndex--)
+            {
+                table[oldIndex, newIndex] = string.Equals(oldLines[oldIndex], newLines[newIndex], StringComparison.Ordinal)
+                    ? table[oldIndex + 1, newIndex + 1] + 1
+                    : Math.Max(table[oldIndex + 1, newIndex], table[oldIndex, newIndex + 1]);
+            }
+        }
+
+        var operations = new List<TextDiffOperation>();
+        var oldLine = 0;
+        var newLine = 0;
+        while (oldLine < oldLines.Length && newLine < newLines.Length)
+        {
+            if (string.Equals(oldLines[oldLine], newLines[newLine], StringComparison.Ordinal))
+            {
+                operations.Add(TextDiffOperation.Context(oldLine + 1, newLine + 1, oldLines[oldLine]));
+                oldLine++;
+                newLine++;
+            }
+            else if (table[oldLine + 1, newLine] >= table[oldLine, newLine + 1])
+            {
+                operations.Add(TextDiffOperation.Removed(oldLine + 1, oldLines[oldLine]));
+                oldLine++;
+            }
+            else
+            {
+                operations.Add(TextDiffOperation.Added(newLine + 1, newLines[newLine]));
+                newLine++;
+            }
+        }
+
+        while (oldLine < oldLines.Length)
+        {
+            operations.Add(TextDiffOperation.Removed(oldLine + 1, oldLines[oldLine]));
+            oldLine++;
+        }
+
+        while (newLine < newLines.Length)
+        {
+            operations.Add(TextDiffOperation.Added(newLine + 1, newLines[newLine]));
+            newLine++;
+        }
+
+        return operations;
+    }
+
+    private static List<TextDiffOperation> BuildPositionalOperations(string[] oldLines, string[] newLines)
+    {
+        var max = Math.Max(oldLines.Length, newLines.Length);
+        var operations = new List<TextDiffOperation>();
+        for (var index = 0; index < max; index++)
+        {
+            var hasOld = index < oldLines.Length;
+            var hasNew = index < newLines.Length;
+            var oldValue = hasOld ? oldLines[index] : "";
+            var newValue = hasNew ? newLines[index] : "";
+            if (hasOld && hasNew && string.Equals(oldValue, newValue, StringComparison.Ordinal))
+            {
+                operations.Add(TextDiffOperation.Context(index + 1, index + 1, oldValue));
+                continue;
+            }
+
+            if (hasOld)
+            {
+                operations.Add(TextDiffOperation.Removed(index + 1, oldValue));
+            }
+
+            if (hasNew)
+            {
+                operations.Add(TextDiffOperation.Added(index + 1, newValue));
+            }
+        }
+
+        return operations;
+    }
+
+    private static IReadOnlyList<TextDiffRow> BuildHunks(IReadOnlyList<TextDiffOperation> operations)
+    {
+        var rows = new List<TextDiffRow>();
+        const int contextLines = 2;
+        var index = 0;
+        while (index < operations.Count)
+        {
+            while (index < operations.Count && operations[index].Kind == "Context")
+            {
+                index++;
+            }
+
+            if (index >= operations.Count)
+            {
+                break;
+            }
+
+            var hunkStart = Math.Max(0, index - contextLines);
+            var hunkEnd = index;
+            var trailingContext = 0;
+            for (var scan = index; scan < operations.Count; scan++)
+            {
+                if (operations[scan].Kind == "Context")
+                {
+                    trailingContext++;
+                    if (trailingContext > contextLines)
+                    {
+                        hunkEnd = scan - trailingContext;
+                        break;
+                    }
+                }
+                else
+                {
+                    trailingContext = 0;
+                    hunkEnd = scan;
+                }
+            }
+
+            hunkEnd = Math.Min(operations.Count - 1, hunkEnd + contextLines);
+            var firstLine = operations[hunkStart].OldLine ?? operations[hunkStart].NewLine ?? 1;
+            rows.Add(TextDiffRow.Hunk(firstLine));
+            for (var rowIndex = hunkStart; rowIndex <= hunkEnd; rowIndex++)
+            {
+                var operation = operations[rowIndex];
+                switch (operation.Kind)
+                {
+                    case "Context":
+                        rows.Add(TextDiffRow.Context(operation.OldLine ?? operation.NewLine ?? 0, operation.Content));
+                        break;
+                    case "Removed":
+                        rows.Add(TextDiffRow.Removed(operation.OldLine ?? 0, operation.Content));
+                        break;
+                    case "Added":
+                        rows.Add(TextDiffRow.Added(operation.NewLine ?? 0, operation.Content));
+                        break;
+                }
+            }
+
+            index = hunkEnd + 1;
+        }
+
+        return rows;
+    }
+
+    public static string ReadText(string filePath)
+    {
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        var bytes = File.ReadAllBytes(filePath);
+        try
+        {
+            return new UTF8Encoding(false, true).GetString(bytes);
+        }
+        catch
+        {
+            return Encoding.GetEncoding("GB18030").GetString(bytes);
+        }
+    }
+
+    private static string[] ReadTextLines(string filePath)
+    {
+        return ReadText(filePath)
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n')
+            .Split('\n');
+    }
+}
+
+internal sealed record TextDiffOperation(string Kind, int? OldLine, int? NewLine, string Content)
+{
+    public static TextDiffOperation Context(int oldLine, int newLine, string content) => new("Context", oldLine, newLine, content);
+
+    public static TextDiffOperation Removed(int oldLine, string content) => new("Removed", oldLine, null, content);
+
+    public static TextDiffOperation Added(int newLine, string content) => new("Added", null, newLine, content);
+}
+
+internal sealed record TextDiffRow(string Kind, string LineNumber, string Content)
+{
+    public string KindText => Kind switch
+    {
+        "Added" => "新增",
+        "Removed" => "删除",
+        "Context" => "上下文",
+        "Hunk" => "变更块",
+        _ => Kind,
+    };
+
+    public static TextDiffRow Hunk(int lineNumber) => new("Hunk", $"@@ line {lineNumber} @@", $"变更块：约第 {lineNumber} 行");
+
+    public static TextDiffRow Context(int lineNumber, string content) => new("Context", lineNumber.ToString(), "  " + content);
+
+    public static TextDiffRow Removed(int lineNumber, string content) => new("Removed", lineNumber.ToString(), "- " + content);
+
+    public static TextDiffRow Added(int lineNumber, string content) => new("Added", lineNumber.ToString(), "+ " + content);
+}
+
+internal sealed class TextDiffForm : Form
+{
+    public TextDiffForm(string title, IReadOnlyList<TextDiffRow> differences)
+    {
+        Text = $"文本差异 - {title}";
+        StartPosition = FormStartPosition.CenterParent;
+        MinimumSize = new Size(980, 560);
+        Size = new Size(1160, 720);
+        Font = new Font("Microsoft YaHei UI", 9F);
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            RowCount = 2,
+            ColumnCount = 1,
+            Padding = new Padding(12),
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        Controls.Add(root);
+
+        root.Controls.Add(new Label
+        {
+            Text = differences.Count == 0 ? "没有发现文本差异" : $"发现 {differences.Count} 行文本差异",
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+        }, 0, 0);
+
+        root.Controls.Add(CreateTextDiffView(differences), 0, 1);
+    }
+
+    public static Control CreateTextDiffView(IReadOnlyList<TextDiffRow> differences)
+    {
+        var rows = differences.ToList();
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            RowCount = 2,
+            ColumnCount = 1,
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        var toolbar = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 4,
+            RowCount = 1,
+            BackColor = Color.FromArgb(248, 249, 250),
+        };
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
+        toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 130));
+
+        var searchBox = new TextBox { Dock = DockStyle.Fill, PlaceholderText = "搜索行号 / 内容", Margin = new Padding(0, 4, 8, 4) };
+        var modeBox = new ComboBox { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(0, 4, 8, 4) };
+        modeBox.Items.AddRange(new object[] { "全部", "只看改动", "只看新增", "只看删除" });
+        modeBox.SelectedIndex = 0;
+        var clearButton = new Button { Text = "清空", Dock = DockStyle.Fill, Margin = new Padding(0, 3, 8, 3) };
+        var countLabel = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft };
+        toolbar.Controls.Add(searchBox, 0, 0);
+        toolbar.Controls.Add(modeBox, 1, 0);
+        toolbar.Controls.Add(clearButton, 2, 0);
+        toolbar.Controls.Add(countLabel, 3, 0);
+        root.Controls.Add(toolbar, 0, 0);
+
+        var grid = CreateTextDiffGrid();
+        root.Controls.Add(grid, 0, 1);
+
+        void ApplyFilter()
+        {
+            var keyword = searchBox.Text.Trim();
+            var mode = modeBox.SelectedItem?.ToString() ?? "全部";
+            var filtered = rows.Where(row =>
+                    MatchesTextMode(row, mode) &&
+                    (string.IsNullOrWhiteSpace(keyword) ||
+                        row.LineNumber.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                        row.Content.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                        row.KindText.Contains(keyword, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+            grid.DataSource = filtered;
+            countLabel.Text = $"{filtered.Count} / {rows.Count} 行";
+        }
+
+        searchBox.TextChanged += (_, _) => ApplyFilter();
+        modeBox.SelectedIndexChanged += (_, _) => ApplyFilter();
+        clearButton.Click += (_, _) =>
+        {
+            searchBox.Clear();
+            modeBox.SelectedIndex = 0;
+        };
+        ApplyFilter();
+        return root;
+    }
+
+    private static bool MatchesTextMode(TextDiffRow row, string mode)
+    {
+        return mode switch
+        {
+            "只看新增" => row.Kind is "Hunk" or "Added",
+            "只看删除" => row.Kind is "Hunk" or "Removed",
+            "只看改动" => row.Kind is "Hunk" or "Added" or "Removed",
+            _ => true,
+        };
+    }
+
+    public static DataGridView CreateTextDiffGrid()
+    {
+        var grid = new DataGridView
+        {
+            Dock = DockStyle.Fill,
+            AllowUserToAddRows = false,
+            AllowUserToDeleteRows = false,
+            AutoGenerateColumns = false,
+            ReadOnly = true,
+            RowHeadersVisible = false,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+        };
+        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "类型", DataPropertyName = nameof(TextDiffRow.KindText), Width = 82 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "行号", DataPropertyName = nameof(TextDiffRow.LineNumber), Width = 110 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "内容", DataPropertyName = nameof(TextDiffRow.Content), Width = 980 });
+        grid.CellFormatting += (_, args) =>
+        {
+            if (args.RowIndex < 0 || grid.Rows[args.RowIndex].DataBoundItem is not TextDiffRow row)
+            {
+                return;
+            }
+
+            grid.Rows[args.RowIndex].DefaultCellStyle.BackColor = row.Kind switch
+            {
+                "Added" => Color.FromArgb(220, 255, 220),
+                "Removed" => Color.FromArgb(255, 225, 225),
+                "Hunk" => Color.FromArgb(235, 235, 235),
+                "Context" => Color.White,
+                _ => Color.White,
+            };
+            if (row.Kind == "Hunk")
+            {
+                grid.Rows[args.RowIndex].DefaultCellStyle.Font = new Font(grid.Font, FontStyle.Bold);
+            }
+        };
+        return grid;
+    }
+}
+
+internal sealed class ConflictFileSet
+{
+    public required string RelativePath { get; init; }
+    public required string CurrentPath { get; init; }
+    public required string MinePath { get; init; }
+    public required string? BasePath { get; init; }
+    public required string? ServerPath { get; init; }
+
+    public static ConflictFileSet? Find(string workingCopyPath, string selectedRelativePath)
+    {
+        var baseRelativePath = NormalizeSelectedConflictPath(selectedRelativePath);
+        var currentPath = Path.Combine(workingCopyPath, baseRelativePath);
+        var directory = Path.GetDirectoryName(currentPath);
+        var fileName = Path.GetFileName(currentPath);
+        if (string.IsNullOrWhiteSpace(directory) || string.IsNullOrWhiteSpace(fileName))
+        {
+            return null;
+        }
+
+        var minePath = currentPath + ".mine";
+        var revisionFiles = Directory.Exists(directory)
+            ? Directory.EnumerateFiles(directory, fileName + ".r*")
+                .Select(path => new RevisionConflictFile(path, ParseRevisionSuffix(path)))
+                .Where(file => file.Revision > 0)
+                .OrderBy(file => file.Revision)
+                .ToList()
+            : [];
+
+        if (!File.Exists(minePath) || revisionFiles.Count == 0)
+        {
+            return null;
+        }
+
+        var basePath = revisionFiles.Count >= 2 ? revisionFiles[0].Path : null;
+        var serverPath = revisionFiles[^1].Path;
+        return new ConflictFileSet
+        {
+            RelativePath = baseRelativePath,
+            CurrentPath = currentPath,
+            MinePath = minePath,
+            BasePath = basePath,
+            ServerPath = serverPath,
+        };
+    }
+
+    private static string NormalizeSelectedConflictPath(string path)
+    {
+        var result = path;
+        if (result.EndsWith(".mine", StringComparison.OrdinalIgnoreCase))
+        {
+            result = result[..^5];
+        }
+        else
+        {
+            var fileName = Path.GetFileName(result);
+            var match = System.Text.RegularExpressions.Regex.Match(fileName, @"\.r\d+$");
+            if (match.Success)
+            {
+                result = result[..^match.Value.Length];
+            }
+        }
+
+        return result;
+    }
+
+    private static long ParseRevisionSuffix(string path)
+    {
+        var fileName = Path.GetFileName(path);
+        var marker = fileName.LastIndexOf(".r", StringComparison.OrdinalIgnoreCase);
+        return marker >= 0 && long.TryParse(fileName[(marker + 2)..], out var revision) ? revision : 0;
+    }
+
+    private sealed record RevisionConflictFile(string Path, long Revision);
+}
+
+internal sealed class ConflictViewerForm : Form
+{
+    public ConflictViewerForm(ConflictFileSet conflict, Action<ConflictFileSet>? openExternalTool = null)
+    {
+        Text = $"冲突查看 - {conflict.RelativePath}";
+        StartPosition = FormStartPosition.CenterParent;
+        MinimumSize = new Size(1120, 680);
+        Size = new Size(1280, 820);
+        Font = new Font("Microsoft YaHei UI", 9F);
+
+        var tabs = new TabControl { Dock = DockStyle.Fill };
+        Controls.Add(tabs);
+        tabs.TabPages.Add(CreateSummaryPage(conflict, openExternalTool));
+
+        if (conflict.ServerPath != null)
+        {
+            tabs.TabPages.Add(CreateDiffPage("我的版本 vs 服务器版本", conflict.MinePath, conflict.ServerPath));
+            if (File.Exists(conflict.CurrentPath))
+            {
+                tabs.TabPages.Add(CreateDiffPage("当前工作文件 vs 服务器版本", conflict.CurrentPath, conflict.ServerPath));
+            }
+        }
+
+        if (conflict.BasePath != null && conflict.ServerPath != null)
+        {
+            tabs.TabPages.Add(CreateDiffPage("旧基础版本 vs 服务器版本", conflict.BasePath, conflict.ServerPath));
+        }
+    }
+
+    private static TabPage CreateSummaryPage(ConflictFileSet conflict, Action<ConflictFileSet>? openExternalTool)
+    {
+        var page = new TabPage("版本文件");
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = openExternalTool == null ? 1 : 2,
+            Padding = new Padding(8),
+        };
+        if (openExternalTool != null)
+        {
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+        }
+
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        page.Controls.Add(root);
+
+        if (openExternalTool != null)
+        {
+            var button = new Button
+            {
+                Text = "用分久必合打开我的版本 vs 服务器版本",
+                Dock = DockStyle.Left,
+                Width = 260,
+            };
+            button.Click += (_, _) => openExternalTool(conflict);
+            root.Controls.Add(button, 0, 0);
+        }
+
+        var text = new TextBox
+        {
+            Dock = DockStyle.Fill,
+            Multiline = true,
+            ReadOnly = true,
+            ScrollBars = ScrollBars.Both,
+            WordWrap = false,
+            Text =
+                $"冲突文件：{conflict.RelativePath}{Environment.NewLine}{Environment.NewLine}" +
+                $"当前工作文件：{conflict.CurrentPath}{Environment.NewLine}" +
+                $"我的版本(.mine)：{conflict.MinePath}{Environment.NewLine}" +
+                $"旧基础版本：{conflict.BasePath ?? "未找到"}{Environment.NewLine}" +
+                $"服务器版本：{conflict.ServerPath ?? "未找到"}{Environment.NewLine}{Environment.NewLine}" +
+                "这里只负责查看，不会修改或自动合并文件。你可以用外部合并工具处理后，再回到主界面标记冲突已解决。",
+        };
+        root.Controls.Add(text, 0, openExternalTool == null ? 0 : 1);
+        return page;
+    }
+
+    private static TabPage CreateDiffPage(string title, string oldFilePath, string newFilePath)
+    {
+        var page = new TabPage(title);
+        Control diffControl;
+        if (DiffFileKindDetector.IsSpreadsheet(oldFilePath) && DiffFileKindDetector.IsSpreadsheet(newFilePath))
+        {
+            var differences = ExcelDiffService.Compare(oldFilePath, newFilePath);
+            diffControl = ExcelDiffForm.CreateExcelDiffView(differences);
+        }
+        else
+        {
+            var differences = TextDiffService.Compare(oldFilePath, newFilePath);
+            diffControl = TextDiffForm.CreateTextDiffView(differences);
+        }
+
+        diffControl.Dock = DockStyle.Fill;
+        page.Controls.Add(diffControl);
+        return page;
+    }
+
+    public static DataGridView CreateExcelDiffGrid(IReadOnlyList<ExcelCellDifference> differences)
+    {
+        var grid = new DataGridView
+        {
+            Dock = DockStyle.Fill,
+            AllowUserToAddRows = false,
+            AllowUserToDeleteRows = false,
+            AutoGenerateColumns = false,
+            ReadOnly = true,
+            RowHeadersVisible = false,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+        };
+
+        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "工作表", DataPropertyName = nameof(ExcelCellDifference.Sheet), Width = 160 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "单元格", DataPropertyName = nameof(ExcelCellDifference.Address), Width = 90 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "字段", DataPropertyName = nameof(ExcelCellDifference.FieldName), Width = 170 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "ID", DataPropertyName = nameof(ExcelCellDifference.RowId), Width = 130 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "旧值", DataPropertyName = nameof(ExcelCellDifference.OldValue), Width = 360 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "新值", DataPropertyName = nameof(ExcelCellDifference.NewValue), Width = 360 });
+        grid.DataSource = differences.ToList();
+        return grid;
+    }
+}
+
+internal sealed record WorkingCopyInfo(long Revision, long LastChangedRevision, long MinRevision, long MaxRevision, string Url)
+{
+    public static WorkingCopyInfo Empty { get; } = new(0, 0, 0, 0, "");
+
+    public string DisplayRevisionText => MinRevision > 0 && MaxRevision > 0 && MinRevision != MaxRevision
+        ? $"r{MinRevision}:r{MaxRevision}（混合版本）"
+        : $"r{Math.Max(MaxRevision, Revision)}";
+}
+
+internal sealed record ChangedFileEntry(string Action, string RepositoryPath, string RelativePath)
+{
+    public string DisplayText => string.IsNullOrWhiteSpace(RepositoryPath)
+        ? $"{Action} {RelativePath}"
+        : $"{Action} {RepositoryPath}";
+
+    public string TreePath => !string.IsNullOrWhiteSpace(RelativePath)
+        ? RelativePath
+        : RepositoryPath.TrimStart('/');
+
+    public static ChangedFileEntry FromWorkingCopy(SvnStatusKind status, string relativePath)
+    {
+        return new ChangedFileEntry(StatusAction(status), "", relativePath);
+    }
+
+    public static ChangedFileEntry ParseRepositoryPath(string line)
+    {
+        var trimmed = line.Trim();
+        var action = trimmed.Length > 0 ? trimmed[0].ToString() : "?";
+        var path = trimmed.Length > 1 ? trimmed[1..].Trim() : "";
+        return new ChangedFileEntry(action, path, ToRelativePath(path));
+    }
+
+    private static string ToRelativePath(string repositoryPath)
+    {
+        var path = repositoryPath.TrimStart('/');
+        return path.StartsWith("trunk/", StringComparison.OrdinalIgnoreCase)
+            ? path["trunk/".Length..]
+            : path;
+    }
+
+    private static string StatusAction(SvnStatusKind status)
+    {
+        return status switch
+        {
+            SvnStatusKind.Modified => "M",
+            SvnStatusKind.Added => "A",
+            SvnStatusKind.Deleted => "D",
+            SvnStatusKind.Unversioned => "?",
+            SvnStatusKind.Missing => "!",
+            SvnStatusKind.Conflicted => "C",
+            SvnStatusKind.Replaced => "R",
+            _ => "?",
+        };
+    }
+}
+
+internal sealed class HistorySearchFilter
+{
+    private HistorySearchFilter()
+    {
+    }
+
+    public string Keyword { get; private init; } = "";
+    public string FileKeyword { get; private init; } = "";
+    public string Author { get; private init; } = "";
+    public string IssueId { get; private init; } = "";
+    public long? RevisionStart { get; private init; }
+    public long? RevisionEnd { get; private init; }
+
+    public bool IsEmpty =>
+        string.IsNullOrWhiteSpace(Keyword) &&
+        string.IsNullOrWhiteSpace(FileKeyword) &&
+        string.IsNullOrWhiteSpace(Author) &&
+        string.IsNullOrWhiteSpace(IssueId) &&
+        RevisionStart == null &&
+        RevisionEnd == null;
+
+    public static HistorySearchFilter Parse(string text)
+    {
+        var keywordParts = new List<string>();
+        var file = "";
+        var author = "";
+        var issue = "";
+        long? revisionStart = null;
+        long? revisionEnd = null;
+
+        foreach (var token in SplitTokens(text))
+        {
+            var parts = token.Split(':', 2);
+            if (parts.Length == 2)
+            {
+                var key = parts[0].Trim().ToLowerInvariant();
+                var value = parts[1].Trim();
+                switch (key)
+                {
+                    case "file":
+                    case "path":
+                    case "文件":
+                    case "路径":
+                        file = value;
+                        continue;
+                    case "author":
+                    case "作者":
+                        author = value;
+                        continue;
+                    case "id":
+                    case "需求":
+                    case "需求号":
+                    case "story":
+                        issue = value.Trim('[', ']');
+                        continue;
+                    case "rev":
+                    case "r":
+                    case "版本":
+                        ParseRevisionRange(value, out revisionStart, out revisionEnd);
+                        continue;
+                }
+            }
+
+            if (token.StartsWith("r", StringComparison.OrdinalIgnoreCase) && token.Length > 1 && char.IsDigit(token[1]))
+            {
+                ParseRevisionRange(token[1..], out revisionStart, out revisionEnd);
+                continue;
+            }
+
+            keywordParts.Add(token);
+        }
+
+        return new HistorySearchFilter
+        {
+            Keyword = string.Join(' ', keywordParts).Trim(),
+            FileKeyword = file,
+            Author = author,
+            IssueId = issue,
+            RevisionStart = revisionStart,
+            RevisionEnd = revisionEnd,
+        };
+    }
+
+    public bool Matches(SvnLogEntry log)
+    {
+        if (!string.IsNullOrWhiteSpace(Author) &&
+            !log.Author.Contains(Author, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (RevisionStart != null && log.Revision < RevisionStart.Value)
+        {
+            return false;
+        }
+
+        if (RevisionEnd != null && log.Revision > RevisionEnd.Value)
+        {
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(FileKeyword) &&
+            !log.ChangedFiles.Any(MatchesFile))
+        {
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(IssueId) &&
+            !log.Message.Contains(IssueId, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(Keyword))
+        {
+            return true;
+        }
+
+        return log.Message.Contains(Keyword, StringComparison.OrdinalIgnoreCase) ||
+            log.Author.Contains(Keyword, StringComparison.OrdinalIgnoreCase) ||
+            log.RevisionText.Contains(Keyword, StringComparison.OrdinalIgnoreCase) ||
+            log.LocalDateText.Contains(Keyword, StringComparison.OrdinalIgnoreCase) ||
+            log.ChangedFiles.Any(file => file.DisplayText.Contains(Keyword, StringComparison.OrdinalIgnoreCase));
+    }
+
+    public bool MatchesFile(ChangedFileEntry file)
+    {
+        if (string.IsNullOrWhiteSpace(FileKeyword))
+        {
+            return false;
+        }
+
+        return file.DisplayText.Contains(FileKeyword, StringComparison.OrdinalIgnoreCase) ||
+            file.TreePath.Contains(FileKeyword, StringComparison.OrdinalIgnoreCase) ||
+            file.RelativePath.Contains(FileKeyword, StringComparison.OrdinalIgnoreCase) ||
+            file.RepositoryPath.Contains(FileKeyword, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static IReadOnlyList<string> SplitTokens(string text)
+    {
+        return (text ?? "")
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    }
+
+    private static void ParseRevisionRange(string value, out long? start, out long? end)
+    {
+        start = null;
+        end = null;
+        var parts = value.Split('-', 2, StringSplitOptions.TrimEntries);
+        if (parts.Length == 1)
+        {
+            if (long.TryParse(parts[0].TrimStart('r', 'R'), out var revision))
+            {
+                start = revision;
+                end = revision;
+            }
+
+            return;
+        }
+
+        if (long.TryParse(parts[0].TrimStart('r', 'R'), out var left))
+        {
+            start = left;
+        }
+
+        if (long.TryParse(parts[1].TrimStart('r', 'R'), out var right))
+        {
+            end = right;
+        }
+
+        if (start > end)
+        {
+            (start, end) = (end, start);
+        }
+    }
+}
+
+internal static class OperationLogger
+{
+    private static readonly string LogPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "SVNManager",
+        "operation.log");
+
+    public static void Log(string action, string workingCopy, string detail)
+    {
+        try
+        {
+            EnsureLogDirectory();
+            var line = string.Join("\t",
+                DateTimeOffset.Now.ToString("yyyy-MM-dd HH:mm:ss zzz"),
+                Environment.UserName,
+                action,
+                workingCopy,
+                detail.Replace("\r", " ", StringComparison.Ordinal).Replace("\n", " ", StringComparison.Ordinal));
+            File.AppendAllText(LogPath, line + Environment.NewLine, Encoding.UTF8);
+        }
+        catch
+        {
+            // Logging must never block the SVN workflow.
+        }
+    }
+
+    public static string EnsureLogFile()
+    {
+        EnsureLogDirectory();
+        if (!File.Exists(LogPath))
+        {
+            File.WriteAllText(LogPath, "", Encoding.UTF8);
+        }
+
+        return LogPath;
+    }
+
+    private static void EnsureLogDirectory()
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(LogPath)!);
+    }
+}
+
+internal sealed record SvnLogEntry(long Revision, string Author, DateTimeOffset Date, string Message)
+{
+    public bool IsUncommitted { get; init; }
+    public bool IsWorkingCopyRevision { get; init; }
+    public IReadOnlyList<ChangedFileEntry> ChangedFiles { get; init; } = [];
+
+    public string GraphText => IsUncommitted ? "●" : IsWorkingCopyRevision ? "● ←" : "●";
+
+    public string RevisionText => IsUncommitted ? "*" : Revision.ToString();
+
+    public string DescriptionText
+    {
+        get
+        {
+            if (IsUncommitted)
+            {
+                return Message;
+            }
+
+            var marker = IsWorkingCopyRevision ? "[当前工作副本] " : "";
+            return marker + ShortMessage;
+        }
+    }
+
+    public string LocalDateText => Date == DateTimeOffset.MinValue
+        ? ""
+        : Date.ToLocalTime().ToString("yyyy-MM-dd HH:mm");
+
+    public string ShortMessage
+    {
+        get
+        {
+            var firstLine = Message
+                .Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)
+                .FirstOrDefault(line => !string.IsNullOrWhiteSpace(line)) ?? "";
+            return firstLine.Length <= 90 ? firstLine : firstLine[..90] + "...";
+        }
+    }
+}
+
+internal sealed record SvnChange(string RelativePath, SvnStatusKind Status)
+{
+    public bool CanCommit => Status is not SvnStatusKind.Conflicted and not SvnStatusKind.Missing;
+
+    public string DisplayStatus => Status switch
+    {
+        SvnStatusKind.Modified => "已修改",
+        SvnStatusKind.Added => "已新增",
+        SvnStatusKind.Deleted => "已删除",
+        SvnStatusKind.Unversioned => "未加入",
+        SvnStatusKind.Missing => "本地缺失",
+        SvnStatusKind.Conflicted => "冲突",
+        SvnStatusKind.Replaced => "已替换",
+        _ => "未知",
+    };
+
+    public string Description => Status switch
+    {
+        SvnStatusKind.Unversioned => "提交时会先执行 svn add",
+        SvnStatusKind.Missing => "文件在本地缺失，暂不自动提交",
+        SvnStatusKind.Conflicted => "需要先解决冲突",
+        _ => "",
+    };
+}
+
+internal enum SvnStatusKind
+{
+    None,
+    Normal,
+    Modified,
+    Added,
+    Deleted,
+    Unversioned,
+    Missing,
+    Conflicted,
+    Replaced,
+}
+
+internal sealed record ProcessResult(int ExitCode, string StandardOutput, string StandardError)
+{
+    public string CombinedOutput => string.Join(
+        Environment.NewLine,
+        new[] { StandardOutput, StandardError }.Where(text => !string.IsNullOrWhiteSpace(text)));
+}
+
+internal sealed record ConflictGridRow(string RelativePath, string Description);
+
+internal sealed record FileTreeNodeInfo(string RelativePath, bool IsFile);
+
+internal sealed class FileTreeNodeSorter : System.Collections.IComparer
+{
+    public int Compare(object? x, object? y)
+    {
+        if (x is not TreeNode left || y is not TreeNode right)
+        {
+            return 0;
+        }
+
+        var leftIsFile = IsFileNode(left);
+        var rightIsFile = IsFileNode(right);
+        if (leftIsFile != rightIsFile)
+        {
+            return leftIsFile ? 1 : -1;
+        }
+
+        return string.Compare(CleanNodeText(left.Text), CleanNodeText(right.Text), StringComparison.CurrentCultureIgnoreCase);
+    }
+
+    private static bool IsFileNode(TreeNode node)
+    {
+        return node.Tag is ChangedFileEntry || node.Tag is FileTreeNodeInfo { IsFile: true };
+    }
+
+    private static string CleanNodeText(string text)
+    {
+        return text.Length > 2 && text[1] == ' ' && "MAD?!CR".Contains(text[0], StringComparison.Ordinal)
+            ? text[2..]
+            : text;
+    }
+}
+
+internal sealed class CommitPreviewForm : Form
+{
+    private readonly TextBox _messageBox = new();
+    private readonly TextBox _searchBox = new();
+    private readonly DataGridView _grid = new();
+    private readonly Label _summaryLabel = new();
+    private readonly Label _blockLabel = new();
+    private readonly List<CommitPreviewRow> _rows;
+    private readonly string? _globalBlockReason;
+
+    public string CommitMessage => _messageBox.Text.Trim();
+
+    public IReadOnlyList<SvnChange> SelectedChanges => _rows
+        .Where(row => row.Include && row.CanSubmit)
+        .Select(row => row.Change)
+        .ToList();
+
+    public CommitPreviewForm(string message, IReadOnlyList<SvnChange> changes, Func<SvnChange, string> blockReasonFactory, string? globalBlockReason = null)
+    {
+        _globalBlockReason = globalBlockReason;
+        _rows = changes
+            .Select(change => new CommitPreviewRow(change, blockReasonFactory(change)))
+            .ToList();
+
+        Text = "准备提交";
+        StartPosition = FormStartPosition.CenterParent;
+        MinimumSize = new Size(760, 480);
+        Size = new Size(920, 620);
+        Font = new Font("Microsoft YaHei UI", 9F);
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 6,
+            Padding = new Padding(12),
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, string.IsNullOrWhiteSpace(globalBlockReason) ? 0 : 34));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 86));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        Controls.Add(root);
+
+        _summaryLabel.Dock = DockStyle.Fill;
+        _summaryLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _summaryLabel.Font = new Font(Font, FontStyle.Bold);
+        root.Controls.Add(_summaryLabel, 0, 0);
+
+        _blockLabel.Dock = DockStyle.Fill;
+        _blockLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _blockLabel.ForeColor = Color.DarkRed;
+        _blockLabel.Font = new Font(Font, FontStyle.Bold);
+        _blockLabel.Text = globalBlockReason ?? "";
+        root.Controls.Add(_blockLabel, 0, 1);
+
+        _messageBox.Dock = DockStyle.Fill;
+        _messageBox.Multiline = true;
+        _messageBox.ReadOnly = false;
+        _messageBox.ScrollBars = ScrollBars.Vertical;
+        _messageBox.Text = message;
+        _messageBox.BackColor = Color.White;
+        root.Controls.Add(_messageBox, 0, 2);
+
+        var filterPanel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 4,
+            RowCount = 1,
+        };
+        filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
+        filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
+        filterPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
+        _searchBox.Dock = DockStyle.Fill;
+        _searchBox.PlaceholderText = "搜索文件 / 状态 / 说明";
+        _searchBox.Margin = new Padding(0, 3, 8, 3);
+        _searchBox.TextChanged += (_, _) => ApplyFilter();
+        filterPanel.Controls.Add(_searchBox, 0, 0);
+        var selectAllButton = new Button { Text = "全选", Dock = DockStyle.Fill, Margin = new Padding(0, 3, 6, 3) };
+        selectAllButton.Click += (_, _) => SetVisibleRowsIncluded(true);
+        filterPanel.Controls.Add(selectAllButton, 1, 0);
+        var selectNoneButton = new Button { Text = "全不选", Dock = DockStyle.Fill, Margin = new Padding(0, 3, 6, 3) };
+        selectNoneButton.Click += (_, _) => SetVisibleRowsIncluded(false);
+        filterPanel.Controls.Add(selectNoneButton, 2, 0);
+        var clearButton = new Button { Text = "清空搜索", Dock = DockStyle.Fill, Margin = new Padding(0, 3, 0, 3) };
+        clearButton.Click += (_, _) => _searchBox.Clear();
+        filterPanel.Controls.Add(clearButton, 3, 0);
+        root.Controls.Add(filterPanel, 0, 3);
+
+        _grid.Dock = DockStyle.Fill;
+        _grid.AllowUserToAddRows = false;
+        _grid.AllowUserToDeleteRows = false;
+        _grid.AutoGenerateColumns = false;
+        _grid.ReadOnly = false;
+        _grid.RowHeadersVisible = false;
+        _grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+        _grid.BackColor = Color.White;
+        _grid.BackgroundColor = Color.White;
+        _grid.Columns.Add(new DataGridViewCheckBoxColumn { HeaderText = "提交", DataPropertyName = nameof(CommitPreviewRow.Include), Width = 58 });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "状态", DataPropertyName = nameof(CommitPreviewRow.Status), Width = 100, ReadOnly = true });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "文件", DataPropertyName = nameof(CommitPreviewRow.RelativePath), Width = 520, ReadOnly = true });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "说明", DataPropertyName = nameof(CommitPreviewRow.Description), Width = 160, ReadOnly = true });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "阻止原因", DataPropertyName = nameof(CommitPreviewRow.BlockReason), Width = 300, ReadOnly = true });
+        _grid.CellBeginEdit += (_, args) =>
+        {
+            if (_grid.Rows[args.RowIndex].DataBoundItem is CommitPreviewRow { CanSubmit: false } ||
+                !string.IsNullOrWhiteSpace(_globalBlockReason))
+            {
+                args.Cancel = true;
+            }
+        };
+        _grid.CurrentCellDirtyStateChanged += (_, _) =>
+        {
+            if (_grid.IsCurrentCellDirty)
+            {
+                _grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
+            }
+        };
+        _grid.CellValueChanged += (_, _) => UpdateSummary();
+        _grid.CellFormatting += (_, args) =>
+        {
+            if (args.RowIndex < 0 || _grid.Rows[args.RowIndex].DataBoundItem is not CommitPreviewRow row)
+            {
+                return;
+            }
+
+            if (!row.CanSubmit || !string.IsNullOrWhiteSpace(_globalBlockReason))
+            {
+                _grid.Rows[args.RowIndex].DefaultCellStyle.BackColor = Color.FromArgb(255, 235, 235);
+                _grid.Rows[args.RowIndex].DefaultCellStyle.ForeColor = Color.DarkRed;
+            }
+        };
+        root.Controls.Add(_grid, 0, 4);
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+        };
+        var okButton = new Button { Text = "确认提交", Width = 110 };
+        var cancelButton = new Button { Text = "取消", Width = 90, DialogResult = DialogResult.Cancel };
+        okButton.Click += (_, _) =>
+        {
+            _grid.EndEdit();
+            if (string.IsNullOrWhiteSpace(CommitMessage))
+            {
+                MessageBox.Show(this, "请先填写提交说明。", "缺少提交说明", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(_globalBlockReason))
+            {
+                MessageBox.Show(this, _globalBlockReason, "提交被拦截", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (SelectedChanges.Count == 0)
+            {
+                MessageBox.Show(this, "请至少保留一个要提交的文件。", "没有提交文件", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            DialogResult = DialogResult.OK;
+        };
+        buttons.Controls.Add(okButton);
+        buttons.Controls.Add(cancelButton);
+        root.Controls.Add(buttons, 0, 5);
+        AcceptButton = okButton;
+        CancelButton = cancelButton;
+        ApplyFilter();
+        _messageBox.SelectAll();
+    }
+
+    private void ApplyFilter()
+    {
+        _grid.EndEdit();
+        var keyword = _searchBox.Text.Trim();
+        var visibleRows = string.IsNullOrWhiteSpace(keyword)
+            ? _rows
+            : _rows.Where(row =>
+                row.RelativePath.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                row.Status.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                row.Description.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+                row.BlockReason.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+        _grid.DataSource = visibleRows;
+        UpdateSummary();
+    }
+
+    private void SetVisibleRowsIncluded(bool include)
+    {
+        _grid.EndEdit();
+        foreach (DataGridViewRow gridRow in _grid.Rows)
+        {
+            if (gridRow.DataBoundItem is CommitPreviewRow row)
+            {
+                row.Include = include && row.CanSubmit && string.IsNullOrWhiteSpace(_globalBlockReason);
+            }
+        }
+
+        _grid.Refresh();
+        UpdateSummary();
+    }
+
+    private void UpdateSummary()
+    {
+        var selectedCount = _rows.Count(row => row.Include);
+        var blockedCount = _rows.Count(row => !row.CanSubmit);
+        _summaryLabel.Text = blockedCount == 0
+            ? $"准备提交 {selectedCount} / {_rows.Count} 个文件"
+            : $"准备提交 {selectedCount} / {_rows.Count} 个文件，{blockedCount} 个文件不可提交";
+    }
+}
+
+internal sealed class CommitPreviewRow
+{
+    public CommitPreviewRow(SvnChange change, string blockReason)
+    {
+        Change = change;
+        Status = change.DisplayStatus;
+        RelativePath = change.RelativePath;
+        Description = change.Description;
+        BlockReason = blockReason;
+        CanSubmit = string.IsNullOrWhiteSpace(blockReason);
+        Include = CanSubmit;
+    }
+
+    public bool Include { get; set; }
+    public bool CanSubmit { get; }
+    public string Status { get; }
+    public string RelativePath { get; }
+    public string Description { get; }
+    public string BlockReason { get; }
+    public SvnChange Change { get; }
+}
+
+internal sealed class FileHistoryForm : Form
+{
+    private readonly string _workingCopy;
+    private readonly string _relativePath;
+    private readonly IReadOnlyList<string> _relativePaths;
+    private readonly string _displayPath;
+    private readonly bool _enableFileDiffPreview;
+    private readonly IReadOnlyList<SvnLogEntry> _logs;
+    private readonly SvnClient _svn;
+    private readonly ListView _historyList = new();
+    private readonly TextBox _detailText = new();
+    private readonly Panel _diffPanel = new();
+    private readonly TreeView _changedFilesTree = new();
+    private readonly ImageList _treeImages = new();
+    private readonly Dictionary<string, DiffPreviewData> _diffPreviewCache = new(StringComparer.Ordinal);
+    private CancellationTokenSource? _diffPreviewCts;
+    private const int MaxFileHistoryDiffPreviewCacheEntries = 40;
+
+    public FileHistoryForm(string workingCopy, string relativePath, IReadOnlyList<SvnLogEntry> logs, SvnClient svn)
+        : this(workingCopy, [relativePath], logs, svn)
+    {
+    }
+
+    public FileHistoryForm(string workingCopy, IReadOnlyList<string> relativePaths, IReadOnlyList<SvnLogEntry> logs, SvnClient svn)
+    {
+        _workingCopy = workingCopy;
+        _relativePaths = relativePaths.Where(path => !string.IsNullOrWhiteSpace(path)).ToList();
+        _relativePath = _relativePaths.Count == 1 ? _relativePaths[0] : "";
+        _displayPath = FormatPathListLabel(_relativePaths);
+        _enableFileDiffPreview = _relativePaths.Count == 1 && File.Exists(Path.Combine(workingCopy, _relativePath));
+        _logs = logs;
+        _svn = svn;
+        Text = _enableFileDiffPreview ? $"文件历史 - {_displayPath}" : $"路径历史 - {_displayPath}";
+        StartPosition = FormStartPosition.CenterParent;
+        MinimumSize = new Size(1120, 720);
+        Size = new Size(1380, 880);
+        Font = new Font("Microsoft YaHei UI", 9F);
+        FormClosing += (_, _) => CancelDiffPreview();
+        ConfigureTreeImages();
+
+        var root = new SplitContainer
+        {
+            Dock = DockStyle.Fill,
+            Orientation = Orientation.Horizontal,
+            SplitterDistance = 250,
+        };
+        Controls.Add(root);
+
+        var top = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            Padding = new Padding(8),
+        };
+        top.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        top.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        top.Controls.Add(new Label
+        {
+            Text = $"{_displayPath}    共 {logs.Count} 条历史",
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Font = new Font(Font, FontStyle.Bold),
+        }, 0, 0);
+
+        _historyList.Dock = DockStyle.Fill;
+        _historyList.View = View.Details;
+        _historyList.FullRowSelect = true;
+        _historyList.GridLines = true;
+        _historyList.HideSelection = false;
+        _historyList.Columns.Add("Description", 620);
+        _historyList.Columns.Add("Date", 150);
+        _historyList.Columns.Add("Author", 120);
+        _historyList.Columns.Add("Commit", 90);
+        _historyList.SelectedIndexChanged += async (_, _) => await ShowSelectedFileRevisionAsync();
+        top.Controls.Add(_historyList, 0, 1);
+        root.Panel1.Controls.Add(top);
+
+        var bottom = new SplitContainer
+        {
+            Dock = DockStyle.Fill,
+            SplitterDistance = 300,
+            FixedPanel = FixedPanel.Panel1,
+        };
+        _detailText.Dock = DockStyle.Fill;
+        _detailText.Multiline = true;
+        _detailText.ReadOnly = true;
+        _detailText.ScrollBars = ScrollBars.Both;
+        _detailText.WordWrap = false;
+        bottom.Panel1.Controls.Add(_detailText);
+
+        var right = new SplitContainer
+        {
+            Dock = DockStyle.Fill,
+            Orientation = Orientation.Horizontal,
+            SplitterDistance = 120,
+            FixedPanel = FixedPanel.Panel1,
+        };
+        _changedFilesTree.Dock = DockStyle.Fill;
+        _changedFilesTree.HideSelection = false;
+        _changedFilesTree.FullRowSelect = true;
+        _changedFilesTree.ShowLines = false;
+        _changedFilesTree.ShowRootLines = false;
+        _changedFilesTree.ItemHeight = 24;
+        _changedFilesTree.BorderStyle = System.Windows.Forms.BorderStyle.None;
+        _changedFilesTree.ImageList = _treeImages;
+        _changedFilesTree.TreeViewNodeSorter = new FileTreeNodeSorter();
+        _changedFilesTree.AfterSelect += async (_, _) => await ShowSelectedChangedFileDiffAsync();
+        right.Panel1.Controls.Add(CreateTitledPanel("Changed files", _changedFilesTree));
+
+        _diffPanel.Dock = DockStyle.Fill;
+        right.Panel2.Controls.Add(CreateTitledPanel("Diff preview", _diffPanel));
+        bottom.Panel2.Controls.Add(right);
+        root.Panel2.Controls.Add(bottom);
+
+        LoadHistoryRows();
+    }
+
+    private void LoadHistoryRows()
+    {
+        _historyList.BeginUpdate();
+        _historyList.Items.Clear();
+        foreach (var log in _logs)
+        {
+            var item = new ListViewItem(log.ShortMessage) { Tag = log };
+            item.SubItems.Add(log.LocalDateText);
+            item.SubItems.Add(log.Author);
+            item.SubItems.Add(log.RevisionText);
+            _historyList.Items.Add(item);
+        }
+        _historyList.EndUpdate();
+        if (_historyList.Items.Count > 0)
+        {
+            _historyList.Items[0].Selected = true;
+            _historyList.Items[0].Focused = true;
+        }
+    }
+
+    private async Task ShowSelectedFileRevisionAsync()
+    {
+        if (_historyList.SelectedItems.Count != 1 || _historyList.SelectedItems[0].Tag is not SvnLogEntry log)
+        {
+            return;
+        }
+
+        _detailText.Text =
+            $"版本：r{log.Revision}{Environment.NewLine}" +
+            $"作者：{log.Author}{Environment.NewLine}" +
+            $"时间：{log.LocalDateText}{Environment.NewLine}{Environment.NewLine}" +
+            log.Message +
+            Environment.NewLine + Environment.NewLine +
+            $"路径：{_displayPath}{Environment.NewLine}{Environment.NewLine}" +
+            $"Changed files ({log.ChangedFiles.Count}){Environment.NewLine}" +
+            string.Join(Environment.NewLine, log.ChangedFiles.Select(file => file.DisplayText));
+
+        PopulateChangedFilesTree(log);
+        if (!_enableFileDiffPreview)
+        {
+            ShowChangedFilesHint();
+            return;
+        }
+
+        var file = log.ChangedFiles.FirstOrDefault(change =>
+            PathMatches(change.RelativePath, _relativePath) ||
+            PathMatches(change.RepositoryPath.TrimStart('/'), _relativePath)) ??
+            new ChangedFileEntry("M", "/trunk/" + _relativePath.Replace('\\', '/'), _relativePath);
+
+        var extension = Path.GetExtension(SvnConflictArtifact.NormalizeToBasePath(_relativePath));
+        var oldTemp = Path.Combine(Path.GetTempPath(), $"SVNManager_FILE_OLD_{Guid.NewGuid():N}{extension}");
+        var newTemp = Path.Combine(Path.GetTempPath(), $"SVNManager_FILE_NEW_{Guid.NewGuid():N}{extension}");
+        var previewCts = BeginDiffPreview();
+        var token = previewCts.Token;
+        var title = $"r{log.Revision}  {_relativePath}";
+        var cacheKey = BuildFileHistoryDiffCacheKey("file", log.Revision, file);
+        if (TryRenderCachedDiff(title, cacheKey, token))
+        {
+            return;
+        }
+
+        ShowDiffLoading(title, "正在准备文件版本...");
+        try
+        {
+            await Form1.PrepareCommittedDiffFilesAsync(_svn, _workingCopy, log.Revision, file, oldTemp, newTemp);
+            await ShowDiffPreviewAsync(title, oldTemp, newTemp, cacheKey, token);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            if (!token.IsCancellationRequested)
+            {
+                ShowDiffMessage(ex.Message);
+            }
+        }
+        finally
+        {
+            TryDelete(oldTemp);
+            TryDelete(newTemp);
+        }
+    }
+
+    private void PopulateChangedFilesTree(SvnLogEntry log)
+    {
+        _changedFilesTree.BeginUpdate();
+        _changedFilesTree.Nodes.Clear();
+        try
+        {
+            var root = new TreeNode($"Changed files ({log.ChangedFiles.Count})")
+            {
+                ImageKey = "folder",
+                SelectedImageKey = "folder",
+            };
+            _changedFilesTree.Nodes.Add(root);
+            foreach (var file in log.ChangedFiles.OrderBy(file => file.TreePath, StringComparer.OrdinalIgnoreCase))
+            {
+                AddChangedFileNode(root, file);
+            }
+
+            root.Expand();
+            _changedFilesTree.Sort();
+        }
+        finally
+        {
+            _changedFilesTree.EndUpdate();
+        }
+    }
+
+    private async Task ShowSelectedChangedFileDiffAsync()
+    {
+        if (_historyList.SelectedItems.Count != 1 ||
+            _historyList.SelectedItems[0].Tag is not SvnLogEntry log ||
+            _changedFilesTree.SelectedNode?.Tag is not ChangedFileEntry file)
+        {
+            return;
+        }
+
+        var extension = Path.GetExtension(SvnConflictArtifact.NormalizeToBasePath(file.TreePath));
+        var oldTemp = Path.Combine(Path.GetTempPath(), $"SVNManager_PATH_OLD_{Guid.NewGuid():N}{extension}");
+        var newTemp = Path.Combine(Path.GetTempPath(), $"SVNManager_PATH_NEW_{Guid.NewGuid():N}{extension}");
+        var previewCts = BeginDiffPreview();
+        var token = previewCts.Token;
+        var title = $"r{log.Revision}  {file.DisplayText}";
+        var cacheKey = BuildFileHistoryDiffCacheKey("changed-file", log.Revision, file);
+        if (TryRenderCachedDiff(title, cacheKey, token))
+        {
+            return;
+        }
+
+        ShowDiffLoading(title, "正在准备文件版本...");
+        try
+        {
+            await Form1.PrepareCommittedDiffFilesAsync(_svn, _workingCopy, log.Revision, file, oldTemp, newTemp);
+            await ShowDiffPreviewAsync(title, oldTemp, newTemp, cacheKey, token);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            if (!token.IsCancellationRequested)
+            {
+                ShowDiffMessage(ex.Message);
+            }
+        }
+        finally
+        {
+            TryDelete(oldTemp);
+            TryDelete(newTemp);
+        }
+    }
+
+    private CancellationTokenSource BeginDiffPreview()
+    {
+        CancelDiffPreview();
+        _diffPreviewCts = new CancellationTokenSource();
+        return _diffPreviewCts;
+    }
+
+    private void CancelDiffPreview()
+    {
+        try
+        {
+            _diffPreviewCts?.Cancel();
+        }
+        catch
+        {
+        }
+    }
+
+    private bool TryRenderCachedDiff(string title, string cacheKey, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        if (!_diffPreviewCache.TryGetValue(cacheKey, out var data))
+        {
+            return false;
+        }
+
+        Form1.RenderDiffPreviewInPanel(_diffPanel, null, title + "    [缓存]", data);
+        return true;
+    }
+
+    private async Task ShowDiffPreviewAsync(string title, string oldFilePath, string newFilePath, string cacheKey, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        ShowDiffLoading(title, "正在计算差异...");
+        var data = await Task.Run(() => Form1.CreateDiffPreviewData(oldFilePath, newFilePath), token);
+        token.ThrowIfCancellationRequested();
+        AddDiffPreviewCache(cacheKey, data);
+        Form1.RenderDiffPreviewInPanel(_diffPanel, null, title, data);
+    }
+
+    private void AddDiffPreviewCache(string cacheKey, DiffPreviewData data)
+    {
+        if (_diffPreviewCache.Count >= MaxFileHistoryDiffPreviewCacheEntries &&
+            !_diffPreviewCache.ContainsKey(cacheKey))
+        {
+            _diffPreviewCache.Remove(_diffPreviewCache.Keys.First());
+        }
+
+        _diffPreviewCache[cacheKey] = data;
+    }
+
+    private void ShowDiffLoading(string title, string message)
+    {
+        _diffPanel.Controls.Clear();
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, title.Contains(Environment.NewLine, StringComparison.Ordinal) ? 46 : 28));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.Controls.Add(new Label
+        {
+            Text = title,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Padding = new Padding(6, 0, 0, 0),
+            BackColor = Color.FromArgb(248, 249, 250),
+        }, 0, 0);
+        root.Controls.Add(new Label
+        {
+            Text = message,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleCenter,
+            ForeColor = Color.FromArgb(85, 95, 105),
+        }, 0, 1);
+        _diffPanel.Controls.Add(root);
+    }
+
+    private string BuildFileHistoryDiffCacheKey(string scope, long revision, ChangedFileEntry file)
+    {
+        return string.Join("|", scope, _workingCopy, revision.ToString(), file.Action, file.RepositoryPath, file.RelativePath, file.TreePath);
+    }
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    private void ShowChangedFilesHint()
+    {
+        ShowDiffMessage("请选择右侧 Changed files 中的具体文件查看本次提交的内容差异。");
+    }
+
+    private void ShowDiffMessage(string message)
+    {
+        _diffPanel.Controls.Clear();
+        _diffPanel.Controls.Add(new TextBox
+        {
+            Dock = DockStyle.Fill,
+            Multiline = true,
+            ReadOnly = true,
+            ScrollBars = ScrollBars.Both,
+            Text = message,
+        });
+    }
+
+    private static Control CreateTitledPanel(string title, Control content)
+    {
+        var panel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            BackColor = Color.White,
+        };
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
+        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        panel.Controls.Add(new Label
+        {
+            Text = title,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Padding = new Padding(8, 0, 0, 0),
+            BackColor = Color.FromArgb(241, 243, 245),
+            Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+        }, 0, 0);
+        panel.Controls.Add(content, 0, 1);
+        return panel;
+    }
+
+    private void ConfigureTreeImages()
+    {
+        _treeImages.ColorDepth = ColorDepth.Depth32Bit;
+        _treeImages.ImageSize = new Size(16, 16);
+        _treeImages.Images.Clear();
+        _treeImages.Images.Add("folder", CreateTreeIcon(Color.FromArgb(219, 164, 64), true));
+        _treeImages.Images.Add("file", CreateTreeIcon(Color.FromArgb(118, 128, 140), false));
+        _treeImages.Images.Add("xml", CreateTreeIcon(Color.FromArgb(39, 132, 85), false));
+        _treeImages.Images.Add("lua", CreateTreeIcon(Color.FromArgb(72, 99, 180), false));
+        _treeImages.Images.Add("changed", CreateTreeIcon(Color.FromArgb(209, 92, 56), false));
+    }
+
+    private static Bitmap CreateTreeIcon(Color color, bool folder)
+    {
+        var bitmap = new Bitmap(16, 16);
+        using var graphics = Graphics.FromImage(bitmap);
+        graphics.Clear(Color.Transparent);
+        using var brush = new SolidBrush(color);
+        using var pen = new Pen(ControlPaint.Dark(color), 1);
+        if (folder)
+        {
+            graphics.FillRectangle(brush, 2, 5, 12, 8);
+            graphics.FillRectangle(brush, 3, 3, 5, 3);
+            graphics.DrawRectangle(pen, 2, 5, 12, 8);
+        }
+        else
+        {
+            graphics.FillRectangle(brush, 4, 2, 8, 12);
+            graphics.DrawRectangle(pen, 4, 2, 8, 12);
+            graphics.DrawLine(Pens.White, 6, 5, 10, 5);
+            graphics.DrawLine(Pens.White, 6, 8, 10, 8);
+        }
+
+        return bitmap;
+    }
+
+    private static void AddChangedFileNode(TreeNode root, ChangedFileEntry file)
+    {
+        var path = file.TreePath;
+        var parts = path.Split('/', '\\', StringSplitOptions.RemoveEmptyEntries);
+        var current = root;
+        for (var index = 0; index < parts.Length; index++)
+        {
+            var part = parts[index];
+            var isFile = index == parts.Length - 1;
+            var existing = current.Nodes.Cast<TreeNode>().FirstOrDefault(node => string.Equals(CleanNodeText(node.Text), part, StringComparison.OrdinalIgnoreCase));
+            if (existing == null)
+            {
+                existing = new TreeNode(isFile ? $"{file.Action} {part}" : part)
+                {
+                    Tag = isFile ? file : null,
+                    ToolTipText = file.DisplayText,
+                    ImageKey = isFile ? FileImageKey(file.TreePath) : "folder",
+                    SelectedImageKey = isFile ? FileImageKey(file.TreePath) : "folder",
+                    ForeColor = isFile ? ActionColor(file.Action) : Color.FromArgb(55, 65, 81),
+                };
+                if (!isFile)
+                {
+                    existing.NodeFont = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+                }
+
+                current.Nodes.Add(existing);
+            }
+
+            current = existing;
+        }
+    }
+
+    private static string FileImageKey(string path)
+    {
+        var extension = Path.GetExtension(path);
+        if (extension.Equals(".xml", StringComparison.OrdinalIgnoreCase) || extension.Equals(".xls", StringComparison.OrdinalIgnoreCase))
+        {
+            return "xml";
+        }
+
+        return extension.Equals(".lua", StringComparison.OrdinalIgnoreCase) ? "lua" : "file";
+    }
+
+    private static Color ActionColor(string action)
+    {
+        return action switch
+        {
+            "A" => Color.FromArgb(38, 128, 72),
+            "D" => Color.FromArgb(170, 67, 67),
+            "M" => Color.FromArgb(166, 103, 34),
+            "R" => Color.FromArgb(128, 79, 160),
+            _ => SystemColors.WindowText,
+        };
+    }
+
+    private static string CleanNodeText(string text)
+    {
+        return text.Length > 2 && text[1] == ' ' && "MAD?!CR".Contains(text[0], StringComparison.Ordinal)
+            ? text[2..]
+            : text;
+    }
+
+    private static bool PathMatches(string candidate, string expected)
+    {
+        var normalizedCandidate = candidate.Replace('\\', '/').Trim('/');
+        var normalizedExpected = expected.Replace('\\', '/').Trim('/');
+        return string.Equals(normalizedCandidate, normalizedExpected, StringComparison.OrdinalIgnoreCase) ||
+            normalizedCandidate.EndsWith("/" + normalizedExpected, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string FormatPathListLabel(IReadOnlyList<string> relativePaths)
+    {
+        if (relativePaths.Count == 0)
+        {
+            return "";
+        }
+
+        if (relativePaths.Count == 1)
+        {
+            return relativePaths[0];
+        }
+
+        return $"{relativePaths.Count} 个路径：" + string.Join("、", relativePaths.Take(3)) + (relativePaths.Count > 3 ? "..." : "");
+    }
+}
+
+internal sealed class AppSettings
+{
+    private static readonly string SettingsPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "SVNManager",
+        "settings.json");
+
+    public string RepositoryUrl { get; set; } = "";
+    public string WorkingCopyPath { get; set; } = "";
+    public string LastCommitMessage { get; set; } = "【策划配置】";
+    public string ExternalMergeToolPath { get; set; } = "";
+    public string? CurrentRepositoryId { get; set; }
+    public List<RepositoryEntry> Repositories { get; set; } = [];
+    public Dictionary<string, List<string>> ExpandedFileTreePaths { get; set; } = [];
+    public UiLayoutSettings UiLayout { get; set; } = new();
+
+    public static AppSettings Load()
+    {
+        try
+        {
+            if (!File.Exists(SettingsPath))
+            {
+                return new AppSettings();
+            }
+
+            var settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsPath)) ?? new AppSettings();
+            settings.UiLayout ??= new UiLayoutSettings();
+            return settings;
+        }
+        catch
+        {
+            return new AppSettings();
+        }
+    }
+
+    public void Save()
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
+        File.WriteAllText(SettingsPath, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    public void MigrateLegacySettings()
+    {
+        if (!string.IsNullOrWhiteSpace(WorkingCopyPath) &&
+            Repositories.All(repository => !PathEquals(repository.WorkingCopyPath, WorkingCopyPath)))
+        {
+            var entry = RepositoryEntry.Create(RepositoryUrl, WorkingCopyPath);
+            Repositories.Add(entry);
+            CurrentRepositoryId ??= entry.Id;
+        }
+
+        if (CurrentRepositoryId == null && Repositories.Count > 0)
+        {
+            CurrentRepositoryId = Repositories[0].Id;
+        }
+
+        Save();
+    }
+
+    public void AddKnownWorkingCopyIfExists(string name, string repositoryUrl, string workingCopyPath)
+    {
+        if (!Directory.Exists(Path.Combine(workingCopyPath, ".svn")) ||
+            Repositories.Any(repository => PathEquals(repository.WorkingCopyPath, workingCopyPath)))
+        {
+            return;
+        }
+
+        var entry = RepositoryEntry.Create(repositoryUrl, workingCopyPath);
+        entry.Name = name;
+        Repositories.Add(entry);
+        CurrentRepositoryId ??= entry.Id;
+        Save();
+    }
+
+    public RepositoryEntry? GetCurrentRepository()
+    {
+        return Repositories.FirstOrDefault(repository => repository.Id == CurrentRepositoryId) ??
+            Repositories.FirstOrDefault();
+    }
+
+    public void UpsertRepository(string repositoryUrl, string workingCopyPath)
+    {
+        if (string.IsNullOrWhiteSpace(workingCopyPath))
+        {
+            return;
+        }
+
+        var existing = Repositories.FirstOrDefault(repository => PathEquals(repository.WorkingCopyPath, workingCopyPath));
+        if (existing == null)
+        {
+            existing = RepositoryEntry.Create(repositoryUrl, workingCopyPath);
+            Repositories.Add(existing);
+        }
+        else
+        {
+            existing.RepositoryUrl = repositoryUrl;
+            existing.WorkingCopyPath = workingCopyPath;
+            existing.Name = RepositoryEntry.BuildName(repositoryUrl, workingCopyPath);
+        }
+
+        CurrentRepositoryId = existing.Id;
+    }
+
+    public HashSet<string> GetExpandedPaths(string workingCopyPath)
+    {
+        return ExpandedFileTreePaths.TryGetValue(NormalizeKey(workingCopyPath), out var paths)
+            ? new HashSet<string>(paths, StringComparer.OrdinalIgnoreCase)
+            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    public void SetExpandedPaths(string workingCopyPath, IEnumerable<string> paths)
+    {
+        if (string.IsNullOrWhiteSpace(workingCopyPath))
+        {
+            return;
+        }
+
+        ExpandedFileTreePaths[NormalizeKey(workingCopyPath)] = paths
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(path => path)
+            .ToList();
+    }
+
+    private static bool PathEquals(string left, string right)
+    {
+        return string.Equals(
+            Path.GetFullPath(left).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+            Path.GetFullPath(right).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizeKey(string path)
+    {
+        return Path.GetFullPath(path)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            .ToLowerInvariant();
+    }
+}
+
+internal sealed class RepositoryEntry
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public string Name { get; set; } = "";
+    public string RepositoryUrl { get; set; } = "";
+    public string WorkingCopyPath { get; set; } = "";
+
+    public static RepositoryEntry Create(string repositoryUrl, string workingCopyPath)
+    {
+        return new RepositoryEntry
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            Name = BuildName(repositoryUrl, workingCopyPath),
+            RepositoryUrl = repositoryUrl,
+            WorkingCopyPath = workingCopyPath,
+        };
+    }
+
+    public static string BuildName(string repositoryUrl, string workingCopyPath)
+    {
+        var folderName = Path.GetFileName(workingCopyPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+        if (!string.IsNullOrWhiteSpace(folderName))
+        {
+            return folderName;
+        }
+
+        return string.IsNullOrWhiteSpace(repositoryUrl) ? workingCopyPath : repositoryUrl;
+    }
+
+    public override string ToString()
+    {
+        return $"{Name}  ({WorkingCopyPath})";
+    }
+}
+
+internal sealed class UiLayoutSettings
+{
+    public int WindowX { get; set; }
+    public int WindowY { get; set; }
+    public int WindowWidth { get; set; }
+    public int WindowHeight { get; set; }
+    public bool IsMaximized { get; set; }
+    public int WorkspaceSplitterDistance { get; set; } = 170;
+    public int HistorySplitterDistance { get; set; } = 240;
+    public int ChangedFilesSplitterDistance { get; set; } = 430;
+    public string SelectedTab { get; set; } = "History";
+}
