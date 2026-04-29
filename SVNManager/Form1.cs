@@ -439,6 +439,8 @@ public partial class Form1 : Form
     private void BuildMoreActionsMenu()
     {
         _moreActionsMenu.Items.Clear();
+        _moreActionsMenu.Items.Add("设置", null, (_, _) => ShowSettingsDialog());
+        _moreActionsMenu.Items.Add(new ToolStripSeparator());
         _moreActionsMenu.Items.Add("查看改动", null, async (_, _) => await RefreshStatusAsync());
         _moreActionsMenu.Items.Add("查看差异", null, async (_, _) => await RunDiffAsync());
         _moreActionsMenu.Items.Add("外部对比/合并", null, async (_, _) => await RunExternalCompareOrMergeAsync());
@@ -448,6 +450,21 @@ public partial class Form1 : Form
         _moreActionsMenu.Items.Add("全部文件：刷新", null, (_, _) => LoadAllFiles());
         _moreActionsMenu.Items.Add("检查工具更新", null, async (_, _) => await ShowToolUpdatePanelAsync());
         _moreActionsMenu.Items.Add("打开操作日志", null, (_, _) => OpenOperationLog());
+    }
+
+    private void ShowSettingsDialog()
+    {
+        using var form = new SettingsForm(_settings);
+        if (form.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        _settings.ExternalMergeToolPath = form.ExternalMergeToolPath;
+        _settings.Save();
+        WriteOutput(string.IsNullOrWhiteSpace(_settings.ExternalMergeToolPath)
+            ? "已清空分久必合路径。"
+            : $"已保存分久必合路径：{_settings.ExternalMergeToolPath}");
     }
 
     private void OpenOperationLog()
@@ -1902,7 +1919,7 @@ try {{
         var toolPath = ResolveExternalMergeToolPath();
         if (string.IsNullOrWhiteSpace(toolPath))
         {
-            MessageBox.Show("没有找到分久必合.exe。请确认新XML表格合并工具已经打包，或在弹出的窗口中选择 exe。", "外部工具未找到", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show("没有配置分久必合.exe。请在“更多操作 -> 设置”里选择本机的分久必合.exe。", "外部工具未配置", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return false;
         }
 
@@ -1923,68 +1940,18 @@ try {{
 
     private string? ResolveExternalMergeToolPath()
     {
-        var bundledCandidates = new[]
-        {
-            Path.Combine(AppContext.BaseDirectory, "ExternalTools", "分久必合", "分久必合.exe"),
-            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "ExternalTools", "分久必合", "分久必合.exe"),
-            Path.Combine(AppContext.BaseDirectory, "新XML表格合并工具", "dist", "分久必合", "分久必合.exe"),
-        };
-
-        var toolPath = bundledCandidates
-            .Select(path => Path.GetFullPath(path))
-            .FirstOrDefault(File.Exists);
-        if (toolPath != null)
-        {
-            _settings.ExternalMergeToolPath = toolPath;
-            _settings.Save();
-            return toolPath;
-        }
-
         if (!string.IsNullOrWhiteSpace(_settings.ExternalMergeToolPath) && File.Exists(_settings.ExternalMergeToolPath))
         {
             return _settings.ExternalMergeToolPath;
         }
 
-        if (toolPath == null)
+        if (!string.IsNullOrWhiteSpace(_settings.ExternalMergeToolPath) && !File.Exists(_settings.ExternalMergeToolPath))
         {
-            toolPath = FindSiblingExternalMergeTool();
-        }
-
-        if (toolPath != null)
-        {
-            _settings.ExternalMergeToolPath = toolPath;
-            _settings.Save();
-            return toolPath;
-        }
-
-        using var dialog = new OpenFileDialog
-        {
-            Title = "选择分久必合.exe",
-            Filter = "分久必合.exe|*.exe|所有文件|*.*",
-            CheckFileExists = true,
-        };
-        if (dialog.ShowDialog(this) != DialogResult.OK)
-        {
-            return null;
-        }
-
-        _settings.ExternalMergeToolPath = dialog.FileName;
-        _settings.Save();
-        return dialog.FileName;
-    }
-
-    private static string? FindSiblingExternalMergeTool()
-    {
-        var current = new DirectoryInfo(AppContext.BaseDirectory);
-        while (current != null)
-        {
-            var candidate = Path.Combine(current.FullName, "新XML表格合并工具", "dist", "分久必合", "分久必合.exe");
-            if (File.Exists(candidate))
-            {
-                return candidate;
-            }
-
-            current = current.Parent;
+            MessageBox.Show(
+                $"配置的分久必合路径不存在：{Environment.NewLine}{_settings.ExternalMergeToolPath}{Environment.NewLine}{Environment.NewLine}请在“更多操作 -> 设置”里重新选择。",
+                "外部工具路径失效",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
         }
 
         return null;
@@ -7001,6 +6968,125 @@ internal sealed record ProcessResult(int ExitCode, string StandardOutput, string
 internal sealed record ConflictGridRow(string RelativePath, string Description);
 
 internal sealed record FileTreeNodeInfo(string RelativePath, bool IsFile);
+
+internal sealed class SettingsForm : Form
+{
+    private readonly TextBox _externalMergeToolText = new();
+
+    public SettingsForm(AppSettings settings)
+    {
+        Text = "设置";
+        StartPosition = FormStartPosition.CenterParent;
+        Width = 720;
+        Height = 220;
+        MinimumSize = new Size(600, 200);
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            Padding = new Padding(12),
+            ColumnCount = 1,
+            RowCount = 3,
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        root.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            Text = "分久必合软件位置",
+            Font = new Font(Font, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft,
+        }, 0, 0);
+
+        var pathRow = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 3,
+        };
+        pathRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        pathRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 86));
+        pathRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 86));
+        _externalMergeToolText.Dock = DockStyle.Fill;
+        _externalMergeToolText.Text = settings.ExternalMergeToolPath;
+        pathRow.Controls.Add(_externalMergeToolText, 0, 0);
+
+        var browseButton = new Button { Text = "选择", Dock = DockStyle.Fill };
+        browseButton.Click += (_, _) => BrowseExternalMergeTool();
+        pathRow.Controls.Add(browseButton, 1, 0);
+
+        var clearButton = new Button { Text = "清空", Dock = DockStyle.Fill };
+        clearButton.Click += (_, _) => _externalMergeToolText.Clear();
+        pathRow.Controls.Add(clearButton, 2, 0);
+        root.Controls.Add(pathRow, 0, 1);
+
+        var bottom = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+        };
+        bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 190));
+        bottom.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            Text = "用于 XML / Excel 表格外部对比与合并。发布包不再内置该工具，需要每台电脑自行配置一次。",
+            ForeColor = SystemColors.GrayText,
+            TextAlign = ContentAlignment.TopLeft,
+        }, 0, 0);
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+        };
+        var cancelButton = new Button { Text = "取消", Width = 80, DialogResult = DialogResult.Cancel };
+        var okButton = new Button { Text = "保存", Width = 80 };
+        okButton.Click += (_, _) => SaveAndClose();
+        buttons.Controls.Add(cancelButton);
+        buttons.Controls.Add(okButton);
+        bottom.Controls.Add(buttons, 1, 0);
+        root.Controls.Add(bottom, 0, 2);
+
+        AcceptButton = okButton;
+        CancelButton = cancelButton;
+        Controls.Add(root);
+    }
+
+    public string ExternalMergeToolPath => _externalMergeToolText.Text.Trim();
+
+    private void BrowseExternalMergeTool()
+    {
+        using var dialog = new OpenFileDialog
+        {
+            Title = "选择分久必合.exe",
+            Filter = "分久必合.exe|*.exe|所有文件|*.*",
+            CheckFileExists = true,
+        };
+        if (!string.IsNullOrWhiteSpace(_externalMergeToolText.Text) && File.Exists(_externalMergeToolText.Text))
+        {
+            dialog.InitialDirectory = Path.GetDirectoryName(_externalMergeToolText.Text);
+        }
+
+        if (dialog.ShowDialog(this) == DialogResult.OK)
+        {
+            _externalMergeToolText.Text = dialog.FileName;
+        }
+    }
+
+    private void SaveAndClose()
+    {
+        if (!string.IsNullOrWhiteSpace(ExternalMergeToolPath) && !File.Exists(ExternalMergeToolPath))
+        {
+            MessageBox.Show("分久必合路径不存在，请重新选择或清空。", "路径错误", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        DialogResult = DialogResult.OK;
+        Close();
+    }
+}
 
 internal sealed class FileTreeNodeSorter : System.Collections.IComparer
 {
