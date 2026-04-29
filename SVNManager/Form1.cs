@@ -977,8 +977,33 @@ public partial class Form1 : Form
         }
 
         var workingCopy = _workingCopyText.Text.Trim();
-        OperationLogger.Log("CleanupStart", workingCopy, "svn cleanup");
-        var result = await RunSvnOperationAsync("正在执行 SVN Clean Up...", async () => await _svn.CleanupAsync(workingCopy));
+        using var form = new CleanupOptionsForm(workingCopy);
+        if (form.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        var options = form.Options;
+        if (options.HasDestructiveActions)
+        {
+            var destructive = new List<string>();
+            if (options.DeleteUnversioned) destructive.Add("删除未加入版本控制的文件和文件夹");
+            if (options.DeleteIgnored) destructive.Add("删除已忽略的文件和文件夹");
+            if (options.RevertAllRecursive) destructive.Add("递归还原所有本地改动");
+            var message =
+                "你选择了会删除或丢弃本地内容的 Clean Up 选项：" + Environment.NewLine + Environment.NewLine +
+                string.Join(Environment.NewLine, destructive.Select(item => "- " + item)) +
+                Environment.NewLine + Environment.NewLine +
+                "这些操作不能在工具内撤销。确定继续？";
+            if (MessageBox.Show(message, "危险操作确认", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.OK)
+            {
+                OperationLogger.Log("CleanupCancelled", workingCopy, options.ToLogText());
+                return;
+            }
+        }
+
+        OperationLogger.Log("CleanupStart", workingCopy, options.ToLogText());
+        var result = await RunSvnOperationAsync("正在执行 SVN Clean Up...", async () => await _svn.CleanupAsync(workingCopy, options));
         OperationLogger.Log(result?.ExitCode == 0 ? "CleanupSuccess" : "CleanupFailed", workingCopy, "");
         await RefreshStatusAsync();
         LoadAllFiles();
@@ -5498,9 +5523,74 @@ internal sealed class SvnClient
         return RunAsync(workingCopyPath, "update");
     }
 
-    public Task<ProcessResult> CleanupAsync(string workingCopyPath)
+    public async Task<ProcessResult> CleanupAsync(string workingCopyPath, CleanupOptions options)
     {
-        return RunAsync(workingCopyPath, "cleanup");
+        var output = new StringBuilder();
+        var exitCode = 0;
+
+        if (options.CleanWorkingCopyStatus || options.BreakWriteLocks || options.FixTimeStamps)
+        {
+            var result = await RunCleanupCommandAsync(workingCopyPath, options.IncludeExternals);
+            output.AppendLine(result.CombinedOutput);
+            exitCode = MergeExitCode(exitCode, result.ExitCode);
+        }
+
+        if (options.VacuumPristineCopies)
+        {
+            var result = await RunCleanupCommandAsync(workingCopyPath, options.IncludeExternals, "--vacuum-pristines");
+            output.AppendLine(result.CombinedOutput);
+            exitCode = MergeExitCode(exitCode, result.ExitCode);
+        }
+
+        if (options.DeleteUnversioned)
+        {
+            var result = await RunCleanupCommandAsync(workingCopyPath, options.IncludeExternals, "--remove-unversioned");
+            output.AppendLine(result.CombinedOutput);
+            exitCode = MergeExitCode(exitCode, result.ExitCode);
+        }
+
+        if (options.DeleteIgnored)
+        {
+            var result = await RunCleanupCommandAsync(workingCopyPath, options.IncludeExternals, "--remove-ignored");
+            output.AppendLine(result.CombinedOutput);
+            exitCode = MergeExitCode(exitCode, result.ExitCode);
+        }
+
+        if (options.RevertAllRecursive)
+        {
+            var result = await RunAsync(workingCopyPath, "revert", "-R", ".");
+            output.AppendLine(result.CombinedOutput);
+            exitCode = MergeExitCode(exitCode, result.ExitCode);
+        }
+
+        if (options.RefreshShellOverlays)
+        {
+            output.AppendLine("Refresh shell overlays 是 TortoiseSVN 的外壳刷新项；本工具已在操作后刷新自身状态。");
+        }
+
+        if (output.Length == 0)
+        {
+            output.AppendLine("没有选择任何 Clean Up 操作。");
+        }
+
+        return new ProcessResult(exitCode, output.ToString(), "");
+    }
+
+    private static Task<ProcessResult> RunCleanupCommandAsync(string workingCopyPath, bool includeExternals, params string[] options)
+    {
+        var args = new List<string> { "cleanup" };
+        args.AddRange(options);
+        if (includeExternals)
+        {
+            args.Add("--include-externals");
+        }
+
+        return RunAsync(workingCopyPath, args.ToArray());
+    }
+
+    private static int MergeExitCode(int current, int next)
+    {
+        return current != 0 ? current : next;
     }
 
     public Task<ProcessResult> UpdateToRevisionAsync(string workingCopyPath, long revision)
@@ -7372,6 +7462,133 @@ internal sealed record ConflictGridRow(string RelativePath, string Description);
 internal sealed record FileTreeNodeInfo(string RelativePath, bool IsFile);
 
 internal sealed record IgnoreGroup(string ParentPath, IReadOnlyList<string> Names);
+
+internal sealed record CleanupOptions(
+    bool CleanWorkingCopyStatus,
+    bool BreakWriteLocks,
+    bool FixTimeStamps,
+    bool VacuumPristineCopies,
+    bool RefreshShellOverlays,
+    bool IncludeExternals,
+    bool DeleteUnversioned,
+    bool DeleteIgnored,
+    bool RevertAllRecursive)
+{
+    public bool HasDestructiveActions => DeleteUnversioned || DeleteIgnored || RevertAllRecursive;
+
+    public string ToLogText()
+    {
+        return string.Join("; ", new[]
+        {
+            $"cleanStatus={CleanWorkingCopyStatus}",
+            $"breakLocks={BreakWriteLocks}",
+            $"fixTimeStamps={FixTimeStamps}",
+            $"vacuumPristines={VacuumPristineCopies}",
+            $"refreshOverlays={RefreshShellOverlays}",
+            $"includeExternals={IncludeExternals}",
+            $"deleteUnversioned={DeleteUnversioned}",
+            $"deleteIgnored={DeleteIgnored}",
+            $"revertAll={RevertAllRecursive}",
+        });
+    }
+}
+
+internal sealed class CleanupOptionsForm : Form
+{
+    private readonly CheckBox _cleanStatus = new() { Text = "Clean up working copy status", Checked = true, AutoSize = true };
+    private readonly CheckBox _breakLocks = new() { Text = "Break write locks", Checked = true, AutoSize = true };
+    private readonly CheckBox _fixTimeStamps = new() { Text = "Fix time stamps", Checked = true, AutoSize = true };
+    private readonly CheckBox _vacuumPristines = new() { Text = "Vacuum pristine copies", Checked = true, AutoSize = true };
+    private readonly CheckBox _refreshOverlays = new() { Text = "Refresh shell overlays", Checked = true, AutoSize = true };
+    private readonly CheckBox _includeExternals = new() { Text = "Include externals", Checked = true, AutoSize = true };
+    private readonly CheckBox _deleteUnversioned = new() { Text = "Delete unversioned files and folders", AutoSize = true };
+    private readonly CheckBox _deleteIgnored = new() { Text = "Delete ignored files and folders", AutoSize = true };
+    private readonly CheckBox _revertAll = new() { Text = "Revert all changes recursively", AutoSize = true };
+
+    public CleanupOptions Options => new(
+        _cleanStatus.Checked,
+        _breakLocks.Checked,
+        _fixTimeStamps.Checked,
+        _vacuumPristines.Checked,
+        _refreshOverlays.Checked,
+        _includeExternals.Checked,
+        _deleteUnversioned.Checked,
+        _deleteIgnored.Checked,
+        _revertAll.Checked);
+
+    public CleanupOptionsForm(string workingCopyPath)
+    {
+        Text = workingCopyPath;
+        StartPosition = FormStartPosition.CenterParent;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        MinimizeBox = false;
+        Width = 500;
+        Height = 365;
+        Font = new Font("Microsoft YaHei UI", 9F);
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 3,
+            Padding = new Padding(16, 14, 16, 12),
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        Controls.Add(root);
+
+        var options = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.TopDown,
+            WrapContents = false,
+        };
+        foreach (var checkBox in new[]
+        {
+            _cleanStatus,
+            _breakLocks,
+            _fixTimeStamps,
+            _vacuumPristines,
+            _refreshOverlays,
+            _includeExternals,
+            _deleteUnversioned,
+            _deleteIgnored,
+            _revertAll,
+        })
+        {
+            checkBox.Margin = new Padding(0, 0, 0, 8);
+            options.Controls.Add(checkBox);
+        }
+
+        root.Controls.Add(options, 0, 0);
+
+        var hint = new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = Color.FromArgb(110, 70, 20),
+            Text = "删除和递归还原类选项默认关闭，执行前会再次确认。",
+        };
+        root.Controls.Add(hint, 0, 1);
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+        };
+        var ok = new Button { Text = "OK", Width = 88, DialogResult = DialogResult.OK };
+        var cancel = new Button { Text = "Cancel", Width = 88, DialogResult = DialogResult.Cancel };
+        buttons.Controls.Add(ok);
+        buttons.Controls.Add(cancel);
+        root.Controls.Add(buttons, 0, 2);
+
+        AcceptButton = ok;
+        CancelButton = cancel;
+    }
+}
 
 internal sealed class SettingsForm : Form
 {
