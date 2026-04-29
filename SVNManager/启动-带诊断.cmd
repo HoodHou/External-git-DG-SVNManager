@@ -1,15 +1,75 @@
 @echo off
-chcp 65001 >nul
+setlocal
 cd /d "%~dp0"
-echo 梦境 SVN 管理器启动诊断
-echo 当前目录: %CD%
+
+set "LOCAL_LOG=%~dp0diagnostic.log"
+set "STARTUP_LOG=%APPDATA%\SVNManager\startup.log"
+
+echo Dream SVN Manager diagnostic > "%LOCAL_LOG%"
+echo Time: %DATE% %TIME% >> "%LOCAL_LOG%"
+echo CurrentDir: %CD% >> "%LOCAL_LOG%"
+echo User: %USERNAME% >> "%LOCAL_LOG%"
+echo Computer: %COMPUTERNAME% >> "%LOCAL_LOG%"
+echo OS: %OS% >> "%LOCAL_LOG%"
+echo Processor: %PROCESSOR_ARCHITECTURE% >> "%LOCAL_LOG%"
+echo. >> "%LOCAL_LOG%"
+
+echo ==========================================
+echo Dream SVN Manager diagnostic
+echo ==========================================
+echo Current directory:
+echo %CD%
+echo.
+echo Diagnostic log:
+echo %LOCAL_LOG%
 echo.
 
 if not exist "SVNManager.exe" (
-  echo 找不到 SVNManager.exe。请确认已经完整解压压缩包。
+  echo ERROR: SVNManager.exe was not found.
+  echo ERROR: SVNManager.exe was not found. >> "%LOCAL_LOG%"
+  echo Please unzip the whole package before running this file.
+  echo.
   pause
   exit /b 1
 )
 
-echo 正在启动 SVNManager.exe...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Start-Process -FilePath '.\SVNManager.exe' -PassThru; Start-Sleep -Seconds 3; if ($p.HasExited) { Write-Host ''; Write-Host ('程序启动后立刻退出，退出码: ' + $p.ExitCode); Write-Host ''; $log = Join-Path $env:APPDATA 'SVNManager\startup.log'; if (Test-Path $log) { Write-Host '启动日志:'; Get-Content $log -Tail 120 } else { Write-Host ('没有找到启动日志: ' + $log) }; Write-Host ''; Read-Host '按回车关闭窗口' } else { Write-Host '程序已经启动。如果仍然没有窗口，请截图这个诊断窗口并发送。'; Start-Sleep -Seconds 2 }"
+echo Files near SVNManager.exe: >> "%LOCAL_LOG%"
+dir /b >> "%LOCAL_LOG%" 2>&1
+echo. >> "%LOCAL_LOG%"
+
+echo Starting SVNManager.exe...
+echo Starting SVNManager.exe... >> "%LOCAL_LOG%"
+start "" "%~dp0SVNManager.exe"
+
+echo Waiting 5 seconds...
+timeout /t 5 /nobreak >nul
+
+tasklist /fi "imagename eq SVNManager.exe" | find /i "SVNManager.exe" >nul
+if errorlevel 1 (
+  echo.
+  echo The program is not running after startup.
+  echo The program is not running after startup. >> "%LOCAL_LOG%"
+) else (
+  echo.
+  echo The program process is running. If you still cannot see a window, send a screenshot of this window and diagnostic.log.
+  echo The program process is running. >> "%LOCAL_LOG%"
+)
+
+echo. >> "%LOCAL_LOG%"
+echo App startup log: %STARTUP_LOG% >> "%LOCAL_LOG%"
+if exist "%STARTUP_LOG%" (
+  echo.
+  echo Last startup log:
+  echo Last startup log: >> "%LOCAL_LOG%"
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Content -LiteralPath $env:APPDATA'\SVNManager\startup.log' -Tail 120" >> "%LOCAL_LOG%" 2>&1
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Content -LiteralPath $env:APPDATA'\SVNManager\startup.log' -Tail 40" 2>nul
+) else (
+  echo.
+  echo No startup.log found yet.
+  echo No startup.log found yet. >> "%LOCAL_LOG%"
+)
+
+echo.
+echo Done. Please send diagnostic.log if the program did not open.
+echo Done. >> "%LOCAL_LOG%"
+pause
