@@ -34,6 +34,7 @@ public partial class Form1 : Form
     private readonly SplitContainer _workspaceSplit = new();
     private readonly SplitContainer _historySplit = new();
     private readonly SplitContainer _changedFilesSplit = new();
+    private readonly ContextMenuStrip _changesListMenu = new();
     private readonly ContextMenuStrip _fileTreeMenu = new();
     private readonly ContextMenuStrip _historyListMenu = new();
     private readonly ContextMenuStrip _historyChangedFilesMenu = new();
@@ -49,14 +50,19 @@ public partial class Form1 : Form
     private readonly ContextMenuStrip _moreActionsMenu = new();
     private readonly ImageList _treeImages = new();
     private readonly ToolStripStatusLabel _statusLabel = new();
+    private readonly ToolStripStatusLabel _toolUpdateStatusLabel = new();
     private readonly ToolStripStatusLabel _remoteStatusLabel = new();
+    private readonly System.Windows.Forms.Timer _toolUpdateTimer = new();
     private readonly System.Windows.Forms.Timer _remoteCheckTimer = new();
     private readonly SvnClient _svn = new();
     private readonly AppSettings _settings;
     private bool _loadingRepository;
     private bool _loadingFileTree;
+    private bool _checkingToolUpdate;
     private bool _checkingRemote;
     private SvnLogEntry? _latestRemoteLog;
+    private GitUpdateStatus? _lastToolUpdateStatus;
+    private string? _lastToolRepositoryRoot;
     private readonly HashSet<string> _selectedFileTreePaths = new(StringComparer.OrdinalIgnoreCase);
     private string? _fileTreeSelectionAnchorPath;
     private SvnLogEntry? _selectedHistoryLog;
@@ -77,11 +83,14 @@ public partial class Form1 : Form
         {
             RestoreUiLayout();
             await LoadRepositoryHistoryAsync();
+            _toolUpdateTimer.Start();
             _remoteCheckTimer.Start();
+            await CheckToolUpdatesAsync(showUpToDateMessage: false);
             await CheckRemoteChangesAsync(showUpToDateMessage: false);
         };
         FormClosing += (_, _) =>
         {
+            _toolUpdateTimer.Stop();
             _remoteCheckTimer.Stop();
             CancelHistoryDiffPreview();
             SaveUiLayout();
@@ -212,6 +221,9 @@ public partial class Form1 : Form
         _changesList.Columns.Add("状态", 90);
         _changesList.Columns.Add("文件", 650);
         _changesList.Columns.Add("说明", 260);
+        _changesList.MouseDown += (_, args) => SelectChangeItemForContextMenu(args);
+        BuildChangesListMenu();
+        _changesList.ContextMenuStrip = _changesListMenu;
 
         _workspaceSplit.Dock = DockStyle.Fill;
         _workspaceSplit.SplitterDistance = 170;
@@ -333,12 +345,18 @@ public partial class Form1 : Form
         var statusStrip = new StatusStrip();
         statusStrip.Items.Add(_statusLabel);
         statusStrip.Items.Add(new ToolStripStatusLabel { Spring = true });
+        _toolUpdateStatusLabel.Text = "工具：未检查";
+        _toolUpdateStatusLabel.IsLink = true;
+        _toolUpdateStatusLabel.Click += async (_, _) => await ShowToolUpdatePanelAsync();
+        statusStrip.Items.Add(_toolUpdateStatusLabel);
         _remoteStatusLabel.Text = "远端：未检查";
         _remoteStatusLabel.IsLink = true;
         _remoteStatusLabel.Click += async (_, _) => await CheckRemoteChangesAsync(showUpToDateMessage: true);
         statusStrip.Items.Add(_remoteStatusLabel);
         _statusLabel.Text = "就绪";
         Controls.Add(statusStrip);
+        _toolUpdateTimer.Interval = 600000;
+        _toolUpdateTimer.Tick += async (_, _) => await CheckToolUpdatesAsync(showUpToDateMessage: false);
         _remoteCheckTimer.Interval = 180000;
         _remoteCheckTimer.Tick += async (_, _) => await CheckRemoteChangesAsync(showUpToDateMessage: false);
         ApplyControlStyle(this);
@@ -431,6 +449,7 @@ public partial class Form1 : Form
         _moreActionsMenu.Items.Add("文件历史", null, async (_, _) => await RunFileHistoryAsync());
         _moreActionsMenu.Items.Add(new ToolStripSeparator());
         _moreActionsMenu.Items.Add("全部文件：刷新", null, (_, _) => LoadAllFiles());
+        _moreActionsMenu.Items.Add("检查工具更新", null, async (_, _) => await ShowToolUpdatePanelAsync());
         _moreActionsMenu.Items.Add("打开操作日志", null, (_, _) => OpenOperationLog());
     }
 
@@ -483,6 +502,55 @@ public partial class Form1 : Form
         panel.Controls.Add(CreateSmallToolbarButton("全选", () => SetAllChecks(true)), 2, 0);
         panel.Controls.Add(CreateSmallToolbarButton("全不选", () => SetAllChecks(false)), 3, 0);
         return panel;
+    }
+
+    private void BuildChangesListMenu()
+    {
+        _changesListMenu.Items.Clear();
+        _changesListMenu.Items.Add("查看差异", null, async (_, _) => await RunDiffAsync());
+        _changesListMenu.Items.Add("打开文件", null, (_, _) => OpenSelectedStatusFile());
+        _changesListMenu.Items.Add("打开所在目录", null, (_, _) => OpenSelectedStatusFileFolder());
+        _changesListMenu.Items.Add(new ToolStripSeparator());
+        _changesListMenu.Items.Add("锁定文件", null, async (_, _) => await LockSelectedFileAsync());
+        _changesListMenu.Items.Add("解锁文件", null, async (_, _) => await UnlockSelectedFileAsync());
+        _changesListMenu.Items.Add("查看锁信息", null, async (_, _) => await ShowSelectedFileLockInfoAsync());
+        _changesListMenu.Items.Add(new ToolStripSeparator());
+        _changesListMenu.Items.Add("还原到 SVN 最新版本...", null, async (_, _) => await RevertSelectedStatusChangesToLatestAsync());
+        _changesListMenu.Opening += (_, args) =>
+        {
+            var selected = GetSelectedStatusChanges();
+            args.Cancel = selected.Count == 0;
+            foreach (ToolStripItem item in _changesListMenu.Items)
+            {
+                if (item is ToolStripSeparator)
+                {
+                    continue;
+                }
+
+                item.Enabled = selected.Count > 0;
+            }
+        };
+    }
+
+    private void SelectChangeItemForContextMenu(MouseEventArgs args)
+    {
+        if (args.Button != MouseButtons.Right)
+        {
+            return;
+        }
+
+        var item = _changesList.GetItemAt(args.X, args.Y);
+        if (item == null)
+        {
+            return;
+        }
+
+        if (!item.Selected)
+        {
+            _changesList.SelectedItems.Clear();
+            item.Selected = true;
+            item.Focused = true;
+        }
     }
 
     private Control CreateHistoryTopPanel(Control content)
@@ -831,6 +899,190 @@ public partial class Form1 : Form
         return result == DialogResult.OK;
     }
 
+    private async Task RevertSelectedStatusChangesToLatestAsync()
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        var selected = GetSelectedStatusChanges()
+            .DistinctBy(change => NormalizeRelativePath(change.RelativePath))
+            .ToList();
+        if (selected.Count == 0)
+        {
+            return;
+        }
+
+        var unsupported = selected
+            .Where(change => change.Status is SvnStatusKind.Unversioned or SvnStatusKind.Added or SvnStatusKind.Conflicted)
+            .ToList();
+        var changes = selected.Except(unsupported).ToList();
+        if (unsupported.Count > 0)
+        {
+            MessageBox.Show(
+                "以下类型不会自动还原到最新：\r\n\r\n" +
+                "- 未加入版本控制：需要手动删除或加入版本控制\r\n" +
+                "- 新增文件：svn revert 后会变成未加入文件，容易误解\r\n" +
+                "- 冲突文件：请走“冲突处理流程”\r\n\r\n" +
+                "本次会跳过这些文件：\r\n" +
+                string.Join(Environment.NewLine, unsupported.Take(8).Select(change => $"{change.DisplayStatus} {change.RelativePath}")) +
+                (unsupported.Count > 8 ? Environment.NewLine + "..." : ""),
+                "部分文件不能自动还原",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+
+        if (changes.Count == 0)
+        {
+            return;
+        }
+
+        if (!ConfirmRevertToLatest(changes))
+        {
+            OperationLogger.Log("RevertToLatestCancelled", _workingCopyText.Text.Trim(), $"files={changes.Count}");
+            return;
+        }
+
+        var workingCopy = _workingCopyText.Text.Trim();
+        SetBusy(true, "正在还原到 SVN 最新版本...");
+        try
+        {
+            var output = new StringBuilder();
+            foreach (var change in changes)
+            {
+                var revert = await _svn.RevertAsync(workingCopy, change.RelativePath);
+                output.AppendLine(revert.CombinedOutput);
+                if (revert.ExitCode != 0)
+                {
+                    continue;
+                }
+
+                var update = await _svn.UpdatePathAsync(workingCopy, change.RelativePath);
+                output.AppendLine(update.CombinedOutput);
+            }
+
+            OperationLogger.Log("RevertToLatest", workingCopy, string.Join(" | ", changes.Select(change => change.RelativePath)));
+            WriteOutput(output.ToString());
+            await RefreshStatusAsync();
+            LoadAllFiles();
+            await LoadRepositoryHistoryAsync();
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private bool ConfirmRevertToLatest(IReadOnlyList<SvnChange> changes)
+    {
+        var message =
+            $"准备把 {changes.Count} 个文件还原到 SVN 最新版本。{Environment.NewLine}{Environment.NewLine}" +
+            "这会丢弃这些文件的本地改动，然后执行 svn update 拉取最新内容。此操作不能在工具内撤销。" +
+            Environment.NewLine + Environment.NewLine +
+            string.Join(Environment.NewLine, changes.Take(10).Select(change => $"{change.DisplayStatus} {change.RelativePath}")) +
+            (changes.Count > 10 ? Environment.NewLine + "..." : "") +
+            Environment.NewLine + Environment.NewLine +
+            "确认继续？";
+        return MessageBox.Show(
+            message,
+            "还原到 SVN 最新版本",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2) == DialogResult.OK;
+    }
+
+    private async Task LockSelectedFileAsync()
+    {
+        var relativePath = GetSelectedRelativePath();
+        if (!ValidateWorkingCopyPath() || string.IsNullOrWhiteSpace(relativePath))
+        {
+            MessageBox.Show("请先选中一个文件。", "未选择文件", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var workingCopy = _workingCopyText.Text.Trim();
+        OperationLogger.Log("LockFileStart", workingCopy, relativePath);
+        var result = await RunSvnOperationAsync("正在锁定文件...", async () => await _svn.LockAsync(workingCopy, relativePath));
+        OperationLogger.Log(result?.ExitCode == 0 ? "LockFileSuccess" : "LockFileFailed", workingCopy, relativePath);
+        await RefreshStatusAsync();
+        LoadAllFiles();
+    }
+
+    private async Task UnlockSelectedFileAsync()
+    {
+        var relativePath = GetSelectedRelativePath();
+        if (!ValidateWorkingCopyPath() || string.IsNullOrWhiteSpace(relativePath))
+        {
+            MessageBox.Show("请先选中一个文件。", "未选择文件", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var workingCopy = _workingCopyText.Text.Trim();
+        OperationLogger.Log("UnlockFileStart", workingCopy, relativePath);
+        var result = await RunSvnOperationAsync("正在解锁文件...", async () => await _svn.UnlockAsync(workingCopy, relativePath));
+        OperationLogger.Log(result?.ExitCode == 0 ? "UnlockFileSuccess" : "UnlockFileFailed", workingCopy, relativePath);
+        await RefreshStatusAsync();
+        LoadAllFiles();
+    }
+
+    private async Task ShowSelectedFileLockInfoAsync()
+    {
+        var relativePath = GetSelectedRelativePath();
+        if (!ValidateWorkingCopyPath() || string.IsNullOrWhiteSpace(relativePath))
+        {
+            MessageBox.Show("请先选中一个文件。", "未选择文件", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        SetBusy(true, "正在读取锁信息...");
+        try
+        {
+            var result = await _svn.InfoAsync(_workingCopyText.Text.Trim(), relativePath);
+            WriteOutput(result.CombinedOutput);
+            MessageBox.Show(
+                BuildLockInfoMessage(relativePath, result),
+                "SVN 锁信息",
+                MessageBoxButtons.OK,
+                result.ExitCode == 0 ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private static string BuildLockInfoMessage(string relativePath, ProcessResult result)
+    {
+        if (result.ExitCode != 0)
+        {
+            return $"读取锁信息失败：{relativePath}{Environment.NewLine}{Environment.NewLine}{result.CombinedOutput}";
+        }
+
+        var lines = result.StandardOutput
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        var lockLines = lines
+            .Where(line =>
+                line.StartsWith("Lock Owner:", StringComparison.OrdinalIgnoreCase) ||
+                line.StartsWith("Lock Created:", StringComparison.OrdinalIgnoreCase) ||
+                line.StartsWith("Lock Comment", StringComparison.OrdinalIgnoreCase) ||
+                line.StartsWith("Lock Token:", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        return lockLines.Count == 0
+            ? $"当前文件没有检测到 SVN 锁。{Environment.NewLine}{Environment.NewLine}{relativePath}"
+            : $"当前文件锁信息：{relativePath}{Environment.NewLine}{Environment.NewLine}{string.Join(Environment.NewLine, lockLines)}";
+    }
+
     private async Task RefreshStatusAsync()
     {
         if (!ValidateWorkingCopyPath())
@@ -905,6 +1157,122 @@ public partial class Form1 : Form
     private void UpdateHistoryBadge(int logCount)
     {
         _historyPage.Text = logCount > 0 ? $"History({logCount})" : "History";
+    }
+
+    private async Task CheckToolUpdatesAsync(bool showUpToDateMessage)
+    {
+        if (_checkingToolUpdate)
+        {
+            return;
+        }
+
+        _checkingToolUpdate = true;
+        try
+        {
+            var repositoryRoot = GitUpdateChecker.FindRepositoryRoot(AppContext.BaseDirectory);
+            _lastToolRepositoryRoot = repositoryRoot;
+            if (repositoryRoot == null)
+            {
+                _lastToolUpdateStatus = null;
+                _toolUpdateStatusLabel.Text = "工具：无Git信息";
+                _toolUpdateStatusLabel.ForeColor = SystemColors.ControlText;
+                if (showUpToDateMessage)
+                {
+                    WriteOutput("当前程序目录没有找到 .git，无法检查 GitHub 工具更新。");
+                }
+
+                return;
+            }
+
+            var status = await GitUpdateChecker.CheckAsync(repositoryRoot);
+            _lastToolUpdateStatus = status;
+            switch (status.State)
+            {
+                case GitUpdateState.RemoteUnavailable:
+                    _toolUpdateStatusLabel.Text = "工具：远端不可用";
+                    _toolUpdateStatusLabel.ForeColor = Color.FromArgb(166, 103, 34);
+                    if (showUpToDateMessage)
+                    {
+                        WriteOutput(status.Message);
+                    }
+
+                    break;
+                case GitUpdateState.UpdateAvailable:
+                    _toolUpdateStatusLabel.Text = $"工具有新版本 {status.RemoteShortSha}";
+                    _toolUpdateStatusLabel.ForeColor = Color.DarkRed;
+                    WriteOutput($"GitHub 工具有新版本：本地 {status.LocalShortSha}，远端 {status.RemoteShortSha}。可在仓库目录执行 git pull 更新。");
+                    break;
+                case GitUpdateState.UpToDate:
+                    _toolUpdateStatusLabel.Text = $"工具最新 {status.LocalShortSha}";
+                    _toolUpdateStatusLabel.ForeColor = Color.FromArgb(45, 100, 65);
+                    if (showUpToDateMessage)
+                    {
+                        WriteOutput($"工具已是 GitHub 最新版本：{status.LocalShortSha}");
+                    }
+
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            _toolUpdateStatusLabel.Text = "工具：检查失败";
+            _toolUpdateStatusLabel.ForeColor = Color.FromArgb(166, 103, 34);
+            if (showUpToDateMessage)
+            {
+                WriteOutput("工具更新检查失败：" + ex.Message);
+            }
+        }
+        finally
+        {
+            _checkingToolUpdate = false;
+        }
+    }
+
+    private async Task ShowToolUpdatePanelAsync()
+    {
+        await CheckToolUpdatesAsync(showUpToDateMessage: false);
+
+        var repositoryRoot = _lastToolRepositoryRoot;
+        var status = _lastToolUpdateStatus;
+        var remoteUrl = "";
+        var updateLog = "";
+        if (!string.IsNullOrWhiteSpace(repositoryRoot))
+        {
+            remoteUrl = await GitUpdateChecker.GetRemoteUrlAsync(repositoryRoot);
+            updateLog = await GitUpdateChecker.GetUpdateLogAsync(repositoryRoot, 30);
+        }
+
+        using var form = new ToolUpdateForm(status, repositoryRoot, remoteUrl, updateLog);
+        if (form.ShowDialog(this) != DialogResult.OK || !form.RunUpdateRequested || string.IsNullOrWhiteSpace(repositoryRoot))
+        {
+            return;
+        }
+
+        SetBusy(true, "正在执行工具更新...");
+        try
+        {
+            OperationLogger.Log("ToolUpdateStart", repositoryRoot, remoteUrl);
+            var result = await GitUpdateChecker.PullAsync(repositoryRoot);
+            WriteOutput(result.CombinedOutput);
+            OperationLogger.Log(result.ExitCode == 0 ? "ToolUpdateSuccess" : "ToolUpdateFailed", repositoryRoot, result.CombinedOutput);
+            MessageBox.Show(
+                result.ExitCode == 0
+                    ? "工具更新命令已执行完成。建议关闭并重新打开程序，使用最新构建。"
+                    : "工具更新命令执行失败，请查看下方输出。",
+                "工具更新",
+                MessageBoxButtons.OK,
+                result.ExitCode == 0 ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+
+        await CheckToolUpdatesAsync(showUpToDateMessage: false);
     }
 
     private async Task CheckRemoteChangesAsync(bool showUpToDateMessage)
@@ -2434,6 +2802,53 @@ public partial class Form1 : Form
             : null;
     }
 
+    private List<SvnChange> GetSelectedStatusChanges()
+    {
+        return _changesList.SelectedItems
+            .Cast<ListViewItem>()
+            .Select(item => item.Tag as SvnChange)
+            .Where(change => change != null)
+            .Cast<SvnChange>()
+            .ToList();
+    }
+
+    private void OpenSelectedStatusFile()
+    {
+        var change = GetSelectedChange();
+        if (change == null)
+        {
+            return;
+        }
+
+        var path = Path.Combine(_workingCopyText.Text.Trim(), change.RelativePath);
+        if (File.Exists(path))
+        {
+            Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+        }
+        else
+        {
+            MessageBox.Show("本地文件不存在。", "无法打开", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+    }
+
+    private void OpenSelectedStatusFileFolder()
+    {
+        var change = GetSelectedChange();
+        if (change == null)
+        {
+            return;
+        }
+
+        var path = Path.Combine(_workingCopyText.Text.Trim(), change.RelativePath);
+        var argument = File.Exists(path)
+            ? $"/select,\"{path}\""
+            : Path.GetDirectoryName(path);
+        if (!string.IsNullOrWhiteSpace(argument))
+        {
+            Process.Start(new ProcessStartInfo("explorer.exe", argument) { UseShellExecute = true });
+        }
+    }
+
     private string CurrentWorkingCopyKey()
     {
         return _workingCopyText.Text.Trim();
@@ -2813,6 +3228,10 @@ public partial class Form1 : Form
         _fileTreeMenu.Items.Add("文件/文件夹历史", null, async (_, _) => await RunFileHistoryAsync());
         _fileTreeMenu.Items.Add("清除选择", null, (_, _) => ClearFileTreeSelection());
         _fileTreeMenu.Items.Add(new ToolStripSeparator());
+        _fileTreeMenu.Items.Add("锁定文件", null, async (_, _) => await LockSelectedFileAsync());
+        _fileTreeMenu.Items.Add("解锁文件", null, async (_, _) => await UnlockSelectedFileAsync());
+        _fileTreeMenu.Items.Add("查看锁信息", null, async (_, _) => await ShowSelectedFileLockInfoAsync());
+        _fileTreeMenu.Items.Add(new ToolStripSeparator());
         _fileTreeMenu.Items.Add("加入版本控制", null, async (_, _) => await AddSelectedTreeFileAsync());
         _fileTreeMenu.Items.Add("标记冲突已解决", null, async (_, _) => await ResolveSelectedTreeFileAsync());
         _fileTreeMenu.Opening += (_, args) =>
@@ -2831,6 +3250,9 @@ public partial class Form1 : Form
                     item.Text is "用分久必合对比/合并" && hasFile ||
                     item.Text is "冲突处理流程" && hasFile ||
                     item.Text is "清除选择" && _selectedFileTreePaths.Count > 0 ||
+                    item.Text is "锁定文件" && hasFile ||
+                    item.Text is "解锁文件" && hasFile ||
+                    item.Text is "查看锁信息" && hasFile ||
                     item.Text is "加入版本控制" && hasFile ||
                     item.Text is "标记冲突已解决" && hasFile;
             }
@@ -2845,13 +3267,26 @@ public partial class Form1 : Form
         _historyChangedFilesMenu.Items.Add(new ToolStripSeparator());
         _historyChangedFilesMenu.Items.Add("用分久必合对比", null, async (_, _) => await RunSelectedHistoryChangedFileExternalCompareAsync());
         _historyChangedFilesMenu.Items.Add("文件历史", null, async (_, _) => await RunSelectedHistoryChangedFileHistoryAsync());
+        _historyChangedFilesMenu.Items.Add(new ToolStripSeparator());
+        _historyChangedFilesMenu.Items.Add("将此文件更新到本次提交版本...", null, async (_, _) => await UpdateSelectedHistoryFileToRevisionAsync());
+        _historyChangedFilesMenu.Items.Add("撤销本次提交对这个文件的改动...", null, async (_, _) => await ReverseMergeSelectedHistoryFileAsync());
+        _historyChangedFilesMenu.Items.Add(new ToolStripSeparator());
         _historyChangedFilesMenu.Items.Add("复制路径", null, (_, _) => CopySelectedHistoryChangedFilePath());
         _historyChangedFilesMenu.Opening += (_, args) =>
         {
             var hasFile = _historyChangedFilesTree.SelectedNode?.Tag is ChangedFileEntry;
+            var hasSingleCommittedRevision = hasFile && _selectedHistoryLog is { IsUncommitted: false, Revision: > 0 };
             foreach (ToolStripItem item in _historyChangedFilesMenu.Items)
             {
-                item.Enabled = item is ToolStripSeparator || hasFile;
+                if (item is ToolStripSeparator)
+                {
+                    item.Enabled = true;
+                    continue;
+                }
+
+                item.Enabled = item.Text is "将此文件更新到本次提交版本..." or "撤销本次提交对这个文件的改动..."
+                    ? hasSingleCommittedRevision
+                    : hasFile;
             }
         };
     }
@@ -3033,6 +3468,128 @@ public partial class Form1 : Form
         }
     }
 
+    private async Task UpdateSelectedHistoryFileToRevisionAsync()
+    {
+        if (!ValidateWorkingCopyPath() ||
+            _historyChangedFilesTree.SelectedNode?.Tag is not ChangedFileEntry file ||
+            _selectedHistoryLog is not { IsUncommitted: false, Revision: > 0 } log)
+        {
+            return;
+        }
+
+        var workingCopy = _workingCopyText.Text.Trim();
+        var relativePath = GetHistoryChangedWorkingCopyRelativePath(file);
+        var localChanges = await _svn.GetStatusAsync(workingCopy);
+        if (!ConfirmUpdateHistoryFileToRevision(file, relativePath, log, localChanges))
+        {
+            OperationLogger.Log("UpdateFileToRevisionCancelled", workingCopy, $"revision={log.Revision}; file={relativePath}");
+            return;
+        }
+
+        OperationLogger.Log("UpdateFileToRevisionStart", workingCopy, $"revision={log.Revision}; file={relativePath}");
+        var result = await RunSvnOperationAsync($"正在把文件更新到 r{log.Revision}...", async () => await _svn.UpdatePathToRevisionAsync(workingCopy, relativePath, log.Revision));
+        OperationLogger.Log(result?.ExitCode == 0 ? "UpdateFileToRevisionSuccess" : "UpdateFileToRevisionFailed", workingCopy, $"revision={log.Revision}; file={relativePath}");
+        await RefreshStatusAsync();
+        LoadAllFiles();
+        await LoadRepositoryHistoryAsync();
+    }
+
+    private async Task ReverseMergeSelectedHistoryFileAsync()
+    {
+        if (!ValidateWorkingCopyPath() ||
+            _historyChangedFilesTree.SelectedNode?.Tag is not ChangedFileEntry file ||
+            _selectedHistoryLog is not { IsUncommitted: false, Revision: > 0 } log)
+        {
+            return;
+        }
+
+        var workingCopy = _workingCopyText.Text.Trim();
+        var relativePath = GetHistoryChangedWorkingCopyRelativePath(file);
+        SetBusy(true, "正在预览撤销改动...");
+        ProcessResult preview;
+        try
+        {
+            preview = await _svn.ReverseMergeRevisionForPathAsync(workingCopy, relativePath, log.Revision, dryRun: true);
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+            return;
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+
+        if (!ConfirmReverseMergeHistoryFile(file, relativePath, log, preview))
+        {
+            OperationLogger.Log("ReverseMergeFileCancelled", workingCopy, $"revision={log.Revision}; file={relativePath}");
+            return;
+        }
+
+        OperationLogger.Log("ReverseMergeFileStart", workingCopy, $"revision={log.Revision}; file={relativePath}");
+        var result = await RunSvnOperationAsync($"正在撤销 r{log.Revision} 对文件的改动...", async () => await _svn.ReverseMergeRevisionForPathAsync(workingCopy, relativePath, log.Revision, dryRun: false));
+        OperationLogger.Log(result?.ExitCode == 0 ? "ReverseMergeFileSuccess" : "ReverseMergeFileFailed", workingCopy, $"revision={log.Revision}; file={relativePath}");
+        await RefreshStatusAsync();
+        LoadAllFiles();
+        await LoadRepositoryHistoryAsync();
+    }
+
+    private bool ConfirmUpdateHistoryFileToRevision(ChangedFileEntry file, string relativePath, SvnLogEntry log, IReadOnlyList<SvnChange> localChanges)
+    {
+        var localStatus = localChanges.FirstOrDefault(change =>
+            string.Equals(NormalizeRelativePath(change.RelativePath), NormalizeRelativePath(relativePath), StringComparison.OrdinalIgnoreCase));
+        var localWarning = localStatus == null
+            ? "这个文件当前没有本地改动。"
+            : $"这个文件当前有本地状态：{localStatus.DisplayStatus}。继续可能覆盖本地修改或产生冲突。";
+        var message =
+            $"准备只把这个文件更新到 r{log.Revision} 的版本。{Environment.NewLine}{Environment.NewLine}" +
+            $"文件：{relativePath}{Environment.NewLine}" +
+            $"提交：r{log.Revision}  {log.Author}  {log.LocalDateText}{Environment.NewLine}" +
+            $"{log.ShortMessage}{Environment.NewLine}{Environment.NewLine}" +
+            $"影响范围：只影响这个文件，不会提交到服务器。{Environment.NewLine}" +
+            $"{localWarning}{Environment.NewLine}{Environment.NewLine}" +
+            $"SVN 路径：{file.DisplayText}{Environment.NewLine}{Environment.NewLine}" +
+            "确认继续？";
+        return MessageBox.Show(
+            message,
+            "文件回退到历史版本",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2) == DialogResult.OK;
+    }
+
+    private bool ConfirmReverseMergeHistoryFile(ChangedFileEntry file, string relativePath, SvnLogEntry log, ProcessResult preview)
+    {
+        if (preview.ExitCode != 0)
+        {
+            MessageBox.Show(
+                $"SVN dry-run 预览失败，已取消撤销操作。{Environment.NewLine}{Environment.NewLine}{preview.CombinedOutput}",
+                "无法撤销本次提交",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return false;
+        }
+
+        var previewText = string.IsNullOrWhiteSpace(preview.CombinedOutput)
+            ? "SVN dry-run 没有输出；通常表示没有可撤销改动，或该文件路径不适合直接撤销。"
+            : preview.CombinedOutput.Trim();
+        var message =
+            $"准备撤销 r{log.Revision} 对这个文件造成的改动。{Environment.NewLine}{Environment.NewLine}" +
+            $"文件：{relativePath}{Environment.NewLine}" +
+            $"提交：r{log.Revision}  {log.Author}  {log.LocalDateText}{Environment.NewLine}" +
+            $"{log.ShortMessage}{Environment.NewLine}{Environment.NewLine}" +
+            $"影响范围：只对这个文件执行 reverse merge，不会自动提交。{Environment.NewLine}" +
+            $"SVN dry-run 预览：{Environment.NewLine}{previewText}{Environment.NewLine}{Environment.NewLine}" +
+            "确认继续？";
+        return MessageBox.Show(
+            message,
+            "撤销单次提交对文件的改动",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2) == DialogResult.OK;
+    }
+
     private void CopySelectedHistoryChangedFilePath()
     {
         if (_historyChangedFilesTree.SelectedNode?.Tag is not ChangedFileEntry file)
@@ -3046,7 +3603,70 @@ public partial class Form1 : Form
 
     private string GetHistoryChangedLocalPath(ChangedFileEntry file)
     {
-        return Path.Combine(_workingCopyText.Text.Trim(), file.RelativePath);
+        return Path.Combine(_workingCopyText.Text.Trim(), GetHistoryChangedWorkingCopyRelativePath(file));
+    }
+
+    private string GetHistoryChangedWorkingCopyRelativePath(ChangedFileEntry file)
+    {
+        if (string.IsNullOrWhiteSpace(file.RepositoryPath))
+        {
+            return file.RelativePath;
+        }
+
+        var repositoryPath = file.RepositoryPath.Trim('/').Replace('/', Path.DirectorySeparatorChar);
+        var workingCopyUrl = _svn.GetWorkingCopyInfo(_workingCopyText.Text.Trim()).Url;
+        var workingCopyRepositoryPath = ExtractWorkingCopyRepositoryPath(workingCopyUrl);
+        if (!string.IsNullOrWhiteSpace(workingCopyRepositoryPath) &&
+            repositoryPath.StartsWith(workingCopyRepositoryPath + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+        {
+            return repositoryPath[(workingCopyRepositoryPath.Length + 1)..];
+        }
+
+        var candidates = new[]
+        {
+            file.RelativePath,
+            repositoryPath,
+            StripFirstPathSegment(repositoryPath),
+            StripFirstPathSegment(StripFirstPathSegment(repositoryPath)),
+        };
+        return candidates.FirstOrDefault(candidate =>
+            !string.IsNullOrWhiteSpace(candidate) &&
+            (File.Exists(Path.Combine(_workingCopyText.Text.Trim(), candidate)) ||
+             Directory.Exists(Path.Combine(_workingCopyText.Text.Trim(), candidate)))) ?? file.RelativePath;
+    }
+
+    private static string ExtractWorkingCopyRepositoryPath(string url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            return "";
+        }
+
+        var segments = uri.AbsolutePath
+            .Trim('/')
+            .Split('/', StringSplitOptions.RemoveEmptyEntries)
+            .Select(Uri.UnescapeDataString)
+            .ToList();
+        for (var start = 0; start < segments.Count; start++)
+        {
+            var suffix = string.Join(Path.DirectorySeparatorChar, segments.Skip(start));
+            if (suffix.StartsWith("trunk", StringComparison.OrdinalIgnoreCase) ||
+                suffix.StartsWith("branch" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ||
+                suffix.StartsWith("branches" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ||
+                suffix.StartsWith("tags" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            {
+                return suffix;
+            }
+        }
+
+        return "";
+    }
+
+    private static string StripFirstPathSegment(string path)
+    {
+        var trimmed = path.TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var index = trimmed.IndexOfAny([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar]);
+        return index < 0 ? "" : trimmed[(index + 1)..];
     }
 
     private async Task AddSelectedTreeFileAsync()
@@ -3165,6 +3785,12 @@ public partial class Form1 : Form
         if (_settings.CurrentRepositoryId == null)
         {
             return;
+        }
+
+        var removedRepository = _settings.Repositories.FirstOrDefault(repository => repository.Id == _settings.CurrentRepositoryId);
+        if (removedRepository != null)
+        {
+            _settings.IgnoreWorkingCopy(removedRepository.WorkingCopyPath);
         }
 
         _settings.Repositories.RemoveAll(repository => repository.Id == _settings.CurrentRepositoryId);
@@ -3898,6 +4524,293 @@ internal sealed class DiffPreviewData
     }
 }
 
+internal enum GitUpdateState
+{
+    UpToDate,
+    UpdateAvailable,
+    RemoteUnavailable,
+}
+
+internal sealed record GitUpdateStatus(GitUpdateState State, string LocalSha, string RemoteSha, string Message)
+{
+    public string LocalShortSha => ShortSha(LocalSha);
+    public string RemoteShortSha => ShortSha(RemoteSha);
+
+    private static string ShortSha(string sha)
+    {
+        return string.IsNullOrWhiteSpace(sha) ? "未知" : sha[..Math.Min(7, sha.Length)];
+    }
+}
+
+internal static class GitUpdateChecker
+{
+    public static string? FindRepositoryRoot(string startPath)
+    {
+        var directory = Directory.Exists(startPath)
+            ? new DirectoryInfo(startPath)
+            : Directory.GetParent(startPath);
+        while (directory != null)
+        {
+            if (Directory.Exists(Path.Combine(directory.FullName, ".git")))
+            {
+                return directory.FullName;
+            }
+
+            directory = directory.Parent;
+        }
+
+        return null;
+    }
+
+    public static async Task<GitUpdateStatus> CheckAsync(string repositoryRoot)
+    {
+        var local = await RunGitAsync(repositoryRoot, "rev-parse", "HEAD");
+        if (local.ExitCode != 0 || string.IsNullOrWhiteSpace(local.StandardOutput))
+        {
+            return new GitUpdateStatus(GitUpdateState.RemoteUnavailable, "", "", "无法读取本地 Git HEAD：" + local.CombinedOutput);
+        }
+
+        var remote = await RunGitAsync(repositoryRoot, "ls-remote", "origin", "refs/heads/main");
+        if (remote.ExitCode != 0)
+        {
+            return new GitUpdateStatus(GitUpdateState.RemoteUnavailable, local.StandardOutput.Trim(), "", "无法连接 GitHub origin/main：" + remote.CombinedOutput);
+        }
+
+        var remoteSha = ParseLsRemoteSha(remote.StandardOutput);
+        if (string.IsNullOrWhiteSpace(remoteSha))
+        {
+            return new GitUpdateStatus(GitUpdateState.RemoteUnavailable, local.StandardOutput.Trim(), "", "GitHub origin/main 暂无可比较版本。");
+        }
+
+        var localSha = local.StandardOutput.Trim();
+        return string.Equals(localSha, remoteSha, StringComparison.OrdinalIgnoreCase)
+            ? new GitUpdateStatus(GitUpdateState.UpToDate, localSha, remoteSha, "")
+            : new GitUpdateStatus(GitUpdateState.UpdateAvailable, localSha, remoteSha, "");
+    }
+
+    public static async Task<string> GetRemoteUrlAsync(string repositoryRoot)
+    {
+        var remote = await RunGitAsync(repositoryRoot, "remote", "get-url", "origin");
+        return remote.ExitCode == 0 ? remote.StandardOutput.Trim() : "";
+    }
+
+    public static async Task<string> GetUpdateLogAsync(string repositoryRoot, int limit)
+    {
+        var fetch = await RunGitAsync(repositoryRoot, "fetch", "origin", "main", "--quiet");
+        if (fetch.ExitCode != 0)
+        {
+            return "无法读取 GitHub 更新内容：" + fetch.CombinedOutput;
+        }
+
+        var log = await RunGitAsync(repositoryRoot, "log", $"--max-count={limit}", "--pretty=format:%h  %s", "HEAD..FETCH_HEAD");
+        if (log.ExitCode != 0)
+        {
+            return "无法生成更新内容：" + log.CombinedOutput;
+        }
+
+        return string.IsNullOrWhiteSpace(log.StandardOutput)
+            ? "当前没有检测到未拉取的提交。"
+            : log.StandardOutput.Trim();
+    }
+
+    public static Task<ProcessResult> PullAsync(string repositoryRoot)
+    {
+        return RunGitAsync(repositoryRoot, "pull", "--ff-only", "origin", "main");
+    }
+
+    private static string ParseLsRemoteSha(string output)
+    {
+        var firstLine = output
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(firstLine))
+        {
+            return "";
+        }
+
+        return firstLine.Split('\t', ' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
+    }
+
+    private static async Task<ProcessResult> RunGitAsync(string repositoryRoot, params string[] arguments)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "git",
+            WorkingDirectory = repositoryRoot,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+
+        foreach (var argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("无法启动 git 命令。");
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        return new ProcessResult(process.ExitCode, await stdoutTask, await stderrTask);
+    }
+}
+
+internal sealed class ToolUpdateForm : Form
+{
+    private readonly string? _repositoryRoot;
+    private readonly string _remoteUrl;
+    public bool RunUpdateRequested { get; private set; }
+
+    public ToolUpdateForm(GitUpdateStatus? status, string? repositoryRoot, string remoteUrl, string updateLog)
+    {
+        _repositoryRoot = repositoryRoot;
+        _remoteUrl = remoteUrl;
+        Text = "工具更新";
+        StartPosition = FormStartPosition.CenterParent;
+        Width = 720;
+        Height = 520;
+        MinimumSize = new Size(620, 420);
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            Padding = new Padding(12),
+            ColumnCount = 1,
+            RowCount = 5,
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 94));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+
+        var title = new Label
+        {
+            Dock = DockStyle.Fill,
+            Text = BuildTitle(status, repositoryRoot),
+            Font = new Font(Font, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft,
+        };
+        root.Controls.Add(title, 0, 0);
+
+        var info = new TextBox
+        {
+            Dock = DockStyle.Fill,
+            Multiline = true,
+            ReadOnly = true,
+            BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle,
+            Text = BuildInfo(status, repositoryRoot, remoteUrl),
+        };
+        root.Controls.Add(info, 0, 1);
+
+        root.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            Text = "更新内容",
+            Font = new Font(Font, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft,
+        }, 0, 2);
+
+        root.Controls.Add(new TextBox
+        {
+            Dock = DockStyle.Fill,
+            Multiline = true,
+            ReadOnly = true,
+            ScrollBars = ScrollBars.Both,
+            WordWrap = false,
+            Text = string.IsNullOrWhiteSpace(updateLog) ? "暂无更新内容。" : updateLog,
+        }, 0, 3);
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            Padding = new Padding(0, 8, 0, 0),
+        };
+        var closeButton = new Button { Text = "关闭", Width = 90, DialogResult = DialogResult.Cancel };
+        var updateButton = new Button { Text = "执行更新命令", Width = 120, Enabled = !string.IsNullOrWhiteSpace(repositoryRoot) };
+        var openLocalButton = new Button { Text = "打开本地目录", Width = 110, Enabled = !string.IsNullOrWhiteSpace(repositoryRoot) };
+        var openGitHubButton = new Button { Text = "打开 GitHub", Width = 110, Enabled = !string.IsNullOrWhiteSpace(remoteUrl) };
+
+        updateButton.Click += (_, _) =>
+        {
+            RunUpdateRequested = true;
+            DialogResult = DialogResult.OK;
+            Close();
+        };
+        openLocalButton.Click += (_, _) =>
+        {
+            if (!string.IsNullOrWhiteSpace(_repositoryRoot) && Directory.Exists(_repositoryRoot))
+            {
+                Process.Start(new ProcessStartInfo("explorer.exe", _repositoryRoot) { UseShellExecute = true });
+            }
+        };
+        openGitHubButton.Click += (_, _) =>
+        {
+            var url = NormalizeRemoteUrl(_remoteUrl);
+            if (!string.IsNullOrWhiteSpace(url))
+            {
+                Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+            }
+        };
+
+        buttons.Controls.Add(closeButton);
+        buttons.Controls.Add(updateButton);
+        buttons.Controls.Add(openLocalButton);
+        buttons.Controls.Add(openGitHubButton);
+        root.Controls.Add(buttons, 0, 4);
+
+        AcceptButton = updateButton;
+        CancelButton = closeButton;
+        Controls.Add(root);
+    }
+
+    private static string BuildTitle(GitUpdateStatus? status, string? repositoryRoot)
+    {
+        if (string.IsNullOrWhiteSpace(repositoryRoot))
+        {
+            return "当前程序没有找到 Git 仓库信息";
+        }
+
+        return status?.State switch
+        {
+            GitUpdateState.UpdateAvailable => "检测到工具新版本",
+            GitUpdateState.UpToDate => "工具已是最新版本",
+            GitUpdateState.RemoteUnavailable => "无法连接 GitHub 远端",
+            _ => "工具更新状态未知",
+        };
+    }
+
+    private static string BuildInfo(GitUpdateStatus? status, string? repositoryRoot, string remoteUrl)
+    {
+        if (string.IsNullOrWhiteSpace(repositoryRoot))
+        {
+            return "当前运行目录向上没有找到 .git，无法比较 GitHub 版本。";
+        }
+
+        return
+            $"本地目录：{repositoryRoot}{Environment.NewLine}" +
+            $"GitHub：{remoteUrl}{Environment.NewLine}" +
+            $"当前版本：{status?.LocalShortSha ?? "未知"}{Environment.NewLine}" +
+            $"GitHub 最新：{status?.RemoteShortSha ?? "未知"}";
+    }
+
+    private static string NormalizeRemoteUrl(string remoteUrl)
+    {
+        if (remoteUrl.StartsWith("git@github.com:", StringComparison.OrdinalIgnoreCase))
+        {
+            var path = remoteUrl["git@github.com:".Length..];
+            return "https://github.com/" + (path.EndsWith(".git", StringComparison.OrdinalIgnoreCase) ? path[..^4] : path);
+        }
+
+        return remoteUrl.EndsWith(".git", StringComparison.OrdinalIgnoreCase)
+            ? remoteUrl[..^4]
+            : remoteUrl;
+    }
+}
+
 internal sealed class SvnClient
 {
     public Task<ProcessResult> CheckoutAsync(string repositoryUrl, string workingCopyPath)
@@ -3913,6 +4826,47 @@ internal sealed class SvnClient
     public Task<ProcessResult> UpdateToRevisionAsync(string workingCopyPath, long revision)
     {
         return RunAsync(workingCopyPath, "update", "-r", revision.ToString());
+    }
+
+    public Task<ProcessResult> UpdatePathAsync(string workingCopyPath, string relativePath)
+    {
+        return RunAsync(workingCopyPath, "update", relativePath);
+    }
+
+    public Task<ProcessResult> UpdatePathToRevisionAsync(string workingCopyPath, string relativePath, long revision)
+    {
+        return RunAsync(workingCopyPath, "update", "-r", revision.ToString(), relativePath);
+    }
+
+    public Task<ProcessResult> RevertAsync(string workingCopyPath, string relativePath)
+    {
+        return RunAsync(workingCopyPath, "revert", relativePath);
+    }
+
+    public Task<ProcessResult> ReverseMergeRevisionForPathAsync(string workingCopyPath, string relativePath, long revision, bool dryRun)
+    {
+        var args = new List<string> { "merge", "-c", "-" + revision, relativePath };
+        if (dryRun)
+        {
+            args.Add("--dry-run");
+        }
+
+        return RunAsync(workingCopyPath, args.ToArray());
+    }
+
+    public Task<ProcessResult> LockAsync(string workingCopyPath, string relativePath)
+    {
+        return RunAsync(workingCopyPath, "lock", relativePath);
+    }
+
+    public Task<ProcessResult> UnlockAsync(string workingCopyPath, string relativePath)
+    {
+        return RunAsync(workingCopyPath, "unlock", relativePath);
+    }
+
+    public Task<ProcessResult> InfoAsync(string workingCopyPath, string relativePath)
+    {
+        return RunAsync(workingCopyPath, "info", relativePath);
     }
 
     public Task<ProcessResult> AddAsync(string workingCopyPath, string relativePath)
@@ -6535,6 +7489,7 @@ internal sealed class AppSettings
     public string ExternalMergeToolPath { get; set; } = "";
     public string? CurrentRepositoryId { get; set; }
     public List<RepositoryEntry> Repositories { get; set; } = [];
+    public List<string> IgnoredWorkingCopyPaths { get; set; } = [];
     public Dictionary<string, List<string>> ExpandedFileTreePaths { get; set; } = [];
     public UiLayoutSettings UiLayout { get; set; } = new();
 
@@ -6548,6 +7503,8 @@ internal sealed class AppSettings
             }
 
             var settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsPath)) ?? new AppSettings();
+            settings.IgnoredWorkingCopyPaths ??= [];
+            settings.ExpandedFileTreePaths ??= [];
             settings.UiLayout ??= new UiLayoutSettings();
             return settings;
         }
@@ -6583,7 +7540,8 @@ internal sealed class AppSettings
 
     public void AddKnownWorkingCopyIfExists(string name, string repositoryUrl, string workingCopyPath)
     {
-        if (!Directory.Exists(Path.Combine(workingCopyPath, ".svn")) ||
+        if (IsIgnoredWorkingCopy(workingCopyPath) ||
+            !Directory.Exists(Path.Combine(workingCopyPath, ".svn")) ||
             Repositories.Any(repository => PathEquals(repository.WorkingCopyPath, workingCopyPath)))
         {
             return;
@@ -6609,6 +7567,7 @@ internal sealed class AppSettings
             return;
         }
 
+        UnignoreWorkingCopy(workingCopyPath);
         var existing = Repositories.FirstOrDefault(repository => PathEquals(repository.WorkingCopyPath, workingCopyPath));
         if (existing == null)
         {
@@ -6623,6 +7582,44 @@ internal sealed class AppSettings
         }
 
         CurrentRepositoryId = existing.Id;
+    }
+
+    public void IgnoreWorkingCopy(string workingCopyPath)
+    {
+        if (string.IsNullOrWhiteSpace(workingCopyPath))
+        {
+            return;
+        }
+
+        var key = NormalizeKey(workingCopyPath);
+        if (IgnoredWorkingCopyPaths.Any(path => string.Equals(path, key, StringComparison.OrdinalIgnoreCase)))
+        {
+            return;
+        }
+
+        IgnoredWorkingCopyPaths.Add(key);
+    }
+
+    public void UnignoreWorkingCopy(string workingCopyPath)
+    {
+        if (string.IsNullOrWhiteSpace(workingCopyPath))
+        {
+            return;
+        }
+
+        var key = NormalizeKey(workingCopyPath);
+        IgnoredWorkingCopyPaths.RemoveAll(path => string.Equals(path, key, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private bool IsIgnoredWorkingCopy(string workingCopyPath)
+    {
+        if (string.IsNullOrWhiteSpace(workingCopyPath))
+        {
+            return false;
+        }
+
+        var key = NormalizeKey(workingCopyPath);
+        return IgnoredWorkingCopyPaths.Any(path => string.Equals(path, key, StringComparison.OrdinalIgnoreCase));
     }
 
     public HashSet<string> GetExpandedPaths(string workingCopyPath)
