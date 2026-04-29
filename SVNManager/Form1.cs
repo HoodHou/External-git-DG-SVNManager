@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Xml.Linq;
@@ -52,7 +53,6 @@ public partial class Form1 : Form
     private readonly ToolStripStatusLabel _statusLabel = new();
     private readonly ToolStripStatusLabel _toolUpdateStatusLabel = new();
     private readonly ToolStripStatusLabel _remoteStatusLabel = new();
-    private readonly System.Windows.Forms.Timer _toolUpdateTimer = new();
     private readonly System.Windows.Forms.Timer _remoteCheckTimer = new();
     private readonly SvnClient _svn = new();
     private readonly AppSettings _settings;
@@ -63,6 +63,7 @@ public partial class Form1 : Form
     private SvnLogEntry? _latestRemoteLog;
     private GitUpdateStatus? _lastToolUpdateStatus;
     private string? _lastToolRepositoryRoot;
+    private ReleaseUpdateStatus? _lastReleaseUpdateStatus;
     private readonly HashSet<string> _selectedFileTreePaths = new(StringComparer.OrdinalIgnoreCase);
     private string? _fileTreeSelectionAnchorPath;
     private SvnLogEntry? _selectedHistoryLog;
@@ -83,14 +84,12 @@ public partial class Form1 : Form
         {
             RestoreUiLayout();
             await LoadRepositoryHistoryAsync();
-            _toolUpdateTimer.Start();
             _remoteCheckTimer.Start();
             await CheckToolUpdatesAsync(showUpToDateMessage: false);
             await CheckRemoteChangesAsync(showUpToDateMessage: false);
         };
         FormClosing += (_, _) =>
         {
-            _toolUpdateTimer.Stop();
             _remoteCheckTimer.Stop();
             CancelHistoryDiffPreview();
             SaveUiLayout();
@@ -355,8 +354,6 @@ public partial class Form1 : Form
         statusStrip.Items.Add(_remoteStatusLabel);
         _statusLabel.Text = "就绪";
         Controls.Add(statusStrip);
-        _toolUpdateTimer.Interval = 600000;
-        _toolUpdateTimer.Tick += async (_, _) => await CheckToolUpdatesAsync(showUpToDateMessage: false);
         _remoteCheckTimer.Interval = 180000;
         _remoteCheckTimer.Tick += async (_, _) => await CheckRemoteChangesAsync(showUpToDateMessage: false);
         ApplyControlStyle(this);
@@ -1169,16 +1166,41 @@ public partial class Form1 : Form
         _checkingToolUpdate = true;
         try
         {
+            _lastReleaseUpdateStatus = await ReleaseUpdateChecker.CheckLatestAsync(AppInfo.Version);
+            if (_lastReleaseUpdateStatus.State == ReleaseUpdateState.UpdateAvailable)
+            {
+                _toolUpdateStatusLabel.Text = $"工具有新版本 {_lastReleaseUpdateStatus.LatestTag}";
+                _toolUpdateStatusLabel.ForeColor = Color.DarkRed;
+                if (showUpToDateMessage)
+                {
+                    WriteOutput($"检测到工具新版本：当前 {AppInfo.VersionText}，最新 {_lastReleaseUpdateStatus.LatestTag}。点击状态栏可打开更新面板。");
+                }
+
+                return;
+            }
+
+            if (_lastReleaseUpdateStatus.State == ReleaseUpdateState.UpToDate)
+            {
+                _toolUpdateStatusLabel.Text = $"工具最新 {AppInfo.VersionText}";
+                _toolUpdateStatusLabel.ForeColor = Color.FromArgb(45, 100, 65);
+                if (showUpToDateMessage)
+                {
+                    WriteOutput($"工具已是最新发布版：{AppInfo.VersionText}");
+                }
+
+                return;
+            }
+
             var repositoryRoot = GitUpdateChecker.FindRepositoryRoot(AppContext.BaseDirectory);
             _lastToolRepositoryRoot = repositoryRoot;
             if (repositoryRoot == null)
             {
                 _lastToolUpdateStatus = null;
-                _toolUpdateStatusLabel.Text = "工具：无Git信息";
-                _toolUpdateStatusLabel.ForeColor = SystemColors.ControlText;
+                _toolUpdateStatusLabel.Text = "工具：检查失败";
+                _toolUpdateStatusLabel.ForeColor = Color.FromArgb(166, 103, 34);
                 if (showUpToDateMessage)
                 {
-                    WriteOutput("当前程序目录没有找到 .git，无法检查 GitHub 工具更新。");
+                    WriteOutput("无法检查 GitHub Release：" + _lastReleaseUpdateStatus.Message);
                 }
 
                 return;
@@ -1232,6 +1254,19 @@ public partial class Form1 : Form
     {
         await CheckToolUpdatesAsync(showUpToDateMessage: false);
 
+        if (_lastReleaseUpdateStatus != null &&
+            (_lastReleaseUpdateStatus.State != ReleaseUpdateState.Unavailable || string.IsNullOrWhiteSpace(_lastToolRepositoryRoot)))
+        {
+            using var releaseForm = ToolUpdateForm.FromRelease(_lastReleaseUpdateStatus);
+            if (releaseForm.ShowDialog(this) != DialogResult.OK || !releaseForm.RunUpdateRequested)
+            {
+                return;
+            }
+
+            await InstallReleaseUpdateAsync(_lastReleaseUpdateStatus);
+            return;
+        }
+
         var repositoryRoot = _lastToolRepositoryRoot;
         var status = _lastToolUpdateStatus;
         var remoteUrl = "";
@@ -1242,7 +1277,7 @@ public partial class Form1 : Form
             updateLog = await GitUpdateChecker.GetUpdateLogAsync(repositoryRoot, 30);
         }
 
-        using var form = new ToolUpdateForm(status, repositoryRoot, remoteUrl, updateLog);
+        using var form = ToolUpdateForm.FromGit(status, repositoryRoot, remoteUrl, updateLog);
         if (form.ShowDialog(this) != DialogResult.OK || !form.RunUpdateRequested || string.IsNullOrWhiteSpace(repositoryRoot))
         {
             return;
@@ -1273,6 +1308,97 @@ public partial class Form1 : Form
         }
 
         await CheckToolUpdatesAsync(showUpToDateMessage: false);
+    }
+
+    private async Task InstallReleaseUpdateAsync(ReleaseUpdateStatus status)
+    {
+        if (status.State != ReleaseUpdateState.UpdateAvailable || string.IsNullOrWhiteSpace(status.AssetDownloadUrl))
+        {
+            MessageBox.Show("当前没有可安装的新版本。", "工具更新", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var confirm = MessageBox.Show(
+            $"准备下载并安装 {status.LatestTag}。{Environment.NewLine}{Environment.NewLine}" +
+            "程序会在下载完成后自动关闭、覆盖当前目录并重新启动。继续？",
+            "自动更新工具",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Information,
+            MessageBoxDefaultButton.Button2);
+        if (confirm != DialogResult.OK)
+        {
+            return;
+        }
+
+        SetBusy(true, "正在下载工具更新...");
+        try
+        {
+            var zipPath = await ReleaseUpdateChecker.DownloadAssetAsync(status.AssetDownloadUrl, status.LatestTag);
+            OperationLogger.Log("ToolReleaseDownloadSuccess", AppContext.BaseDirectory, zipPath);
+            StartSelfUpdater(zipPath);
+            Application.Exit();
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private static void StartSelfUpdater(string zipPath)
+    {
+        var targetDirectory = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var updateRoot = Path.Combine(Path.GetTempPath(), "DreamSVNManagerUpdate", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(updateRoot);
+        var scriptPath = Path.Combine(updateRoot, "apply-update.ps1");
+        var extractDirectory = Path.Combine(updateRoot, "extract");
+        var exePath = Path.Combine(targetDirectory, "SVNManager.exe");
+        var script = $@"
+$ErrorActionPreference = 'Stop'
+$processId = {Environment.ProcessId}
+$zipPath = {PowerShellQuote(zipPath)}
+$targetDirectory = {PowerShellQuote(targetDirectory)}
+$extractDirectory = {PowerShellQuote(extractDirectory)}
+$exePath = {PowerShellQuote(exePath)}
+try {{
+    Wait-Process -Id $processId -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 800
+    if (Test-Path -LiteralPath $extractDirectory) {{
+        Remove-Item -LiteralPath $extractDirectory -Recurse -Force
+    }}
+    New-Item -ItemType Directory -Force -Path $extractDirectory | Out-Null
+    Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDirectory -Force
+    Copy-Item -Path (Join-Path $extractDirectory '*') -Destination $targetDirectory -Recurse -Force
+    Start-Process -FilePath $exePath
+}} catch {{
+    Add-Type -AssemblyName System.Windows.Forms
+    [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '工具更新失败')
+}}
+";
+        File.WriteAllText(scriptPath, script, Encoding.UTF8);
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden,
+            ArgumentList =
+            {
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                scriptPath,
+            },
+        });
+    }
+
+    private static string PowerShellQuote(string value)
+    {
+        return "'" + value.Replace("'", "''", StringComparison.Ordinal) + "'";
     }
 
     private async Task CheckRemoteChangesAsync(bool showUpToDateMessage)
@@ -4531,6 +4657,31 @@ internal enum GitUpdateState
     RemoteUnavailable,
 }
 
+internal enum ReleaseUpdateState
+{
+    UpToDate,
+    UpdateAvailable,
+    Unavailable,
+}
+
+internal sealed record ReleaseUpdateStatus(
+    ReleaseUpdateState State,
+    string CurrentVersion,
+    string LatestTag,
+    string ReleaseName,
+    string ReleaseNotes,
+    string ReleaseUrl,
+    string AssetName,
+    string AssetDownloadUrl,
+    string Message);
+
+internal static class AppInfo
+{
+    public static Version Version { get; } = Assembly.GetExecutingAssembly().GetName().Version ?? new Version(0, 0, 0, 0);
+
+    public static string VersionText => $"{Version.Major}.{Version.Minor}.{Version.Build}";
+}
+
 internal sealed record GitUpdateStatus(GitUpdateState State, string LocalSha, string RemoteSha, string Message)
 {
     public string LocalShortSha => ShortSha(LocalSha);
@@ -4539,6 +4690,141 @@ internal sealed record GitUpdateStatus(GitUpdateState State, string LocalSha, st
     private static string ShortSha(string sha)
     {
         return string.IsNullOrWhiteSpace(sha) ? "未知" : sha[..Math.Min(7, sha.Length)];
+    }
+}
+
+internal static class ReleaseUpdateChecker
+{
+    private const string LatestReleaseUrl = "https://api.github.com/repos/HoodHou/External-git-DG-SVNManager/releases/latest";
+    private static readonly HttpClient Http = CreateHttpClient();
+
+    public static async Task<ReleaseUpdateStatus> CheckLatestAsync(Version currentVersion)
+    {
+        try
+        {
+            using var response = await Http.GetAsync(LatestReleaseUrl);
+            if (!response.IsSuccessStatusCode)
+            {
+                return Unavailable($"GitHub Release 检查失败：HTTP {(int)response.StatusCode}");
+            }
+
+            await using var stream = await response.Content.ReadAsStreamAsync();
+            using var document = await JsonDocument.ParseAsync(stream);
+            var root = document.RootElement;
+            var tag = ReadString(root, "tag_name");
+            var releaseName = ReadString(root, "name");
+            var notes = ReadString(root, "body");
+            var url = ReadString(root, "html_url");
+            var latestVersion = ParseVersion(tag);
+            var asset = FindWindowsZipAsset(root);
+            if (string.IsNullOrWhiteSpace(tag) || latestVersion == null)
+            {
+                return Unavailable("GitHub Release 没有有效版本号。");
+            }
+
+            var state = latestVersion > NormalizeVersion(currentVersion)
+                ? ReleaseUpdateState.UpdateAvailable
+                : ReleaseUpdateState.UpToDate;
+            return new ReleaseUpdateStatus(
+                state,
+                AppInfo.VersionText,
+                tag,
+                releaseName,
+                notes,
+                url,
+                asset.Name,
+                asset.DownloadUrl,
+                "");
+        }
+        catch (Exception ex)
+        {
+            return Unavailable(ex.Message);
+        }
+    }
+
+    public static async Task<string> DownloadAssetAsync(string assetDownloadUrl, string tag)
+    {
+        if (string.IsNullOrWhiteSpace(assetDownloadUrl))
+        {
+            throw new InvalidOperationException("GitHub Release 没有可下载的 Windows zip。");
+        }
+
+        var directory = Path.Combine(Path.GetTempPath(), "DreamSVNManagerUpdate");
+        Directory.CreateDirectory(directory);
+        var zipPath = Path.Combine(directory, $"DreamSVNManager-{tag}-{Guid.NewGuid():N}.zip");
+        using var response = await Http.GetAsync(assetDownloadUrl);
+        response.EnsureSuccessStatusCode();
+        await using var input = await response.Content.ReadAsStreamAsync();
+        await using var output = File.Create(zipPath);
+        await input.CopyToAsync(output);
+        return zipPath;
+    }
+
+    private static ReleaseUpdateStatus Unavailable(string message)
+    {
+        return new ReleaseUpdateStatus(
+            ReleaseUpdateState.Unavailable,
+            AppInfo.VersionText,
+            "",
+            "",
+            "",
+            "https://github.com/HoodHou/External-git-DG-SVNManager/releases",
+            "",
+            "",
+            message);
+    }
+
+    private static HttpClient CreateHttpClient()
+    {
+        var client = new HttpClient();
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("DreamSVNManager/" + AppInfo.VersionText);
+        client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
+        client.Timeout = TimeSpan.FromSeconds(15);
+        return client;
+    }
+
+    private static (string Name, string DownloadUrl) FindWindowsZipAsset(JsonElement release)
+    {
+        if (!release.TryGetProperty("assets", out var assets) || assets.ValueKind != JsonValueKind.Array)
+        {
+            return ("", "");
+        }
+
+        foreach (var asset in assets.EnumerateArray())
+        {
+            var name = ReadString(asset, "name");
+            if (name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) &&
+                name.Contains("win-x64", StringComparison.OrdinalIgnoreCase))
+            {
+                return (name, ReadString(asset, "browser_download_url"));
+            }
+        }
+
+        var firstZip = assets.EnumerateArray()
+            .Select(asset => (Name: ReadString(asset, "name"), DownloadUrl: ReadString(asset, "browser_download_url")))
+            .FirstOrDefault(asset => asset.Name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase));
+        return firstZip;
+    }
+
+    private static Version? ParseVersion(string tag)
+    {
+        var normalized = tag.Trim().TrimStart('v', 'V');
+        return Version.TryParse(normalized, out var version) ? NormalizeVersion(version) : null;
+    }
+
+    private static Version NormalizeVersion(Version version)
+    {
+        return new Version(
+            Math.Max(version.Major, 0),
+            Math.Max(version.Minor, 0),
+            version.Build < 0 ? 0 : version.Build);
+    }
+
+    private static string ReadString(JsonElement element, string propertyName)
+    {
+        return element.TryGetProperty(propertyName, out var property) && property.ValueKind == JsonValueKind.String
+            ? property.GetString() ?? ""
+            : "";
     }
 }
 
@@ -4659,13 +4945,20 @@ internal static class GitUpdateChecker
 
 internal sealed class ToolUpdateForm : Form
 {
-    private readonly string? _repositoryRoot;
+    private readonly string? _localDirectory;
     private readonly string _remoteUrl;
     public bool RunUpdateRequested { get; private set; }
 
-    public ToolUpdateForm(GitUpdateStatus? status, string? repositoryRoot, string remoteUrl, string updateLog)
+    private ToolUpdateForm(
+        string titleText,
+        string infoText,
+        string updateLog,
+        string updateButtonText,
+        bool updateEnabled,
+        string? localDirectory,
+        string remoteUrl)
     {
-        _repositoryRoot = repositoryRoot;
+        _localDirectory = localDirectory;
         _remoteUrl = remoteUrl;
         Text = "工具更新";
         StartPosition = FormStartPosition.CenterParent;
@@ -4689,7 +4982,7 @@ internal sealed class ToolUpdateForm : Form
         var title = new Label
         {
             Dock = DockStyle.Fill,
-            Text = BuildTitle(status, repositoryRoot),
+            Text = titleText,
             Font = new Font(Font, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleLeft,
         };
@@ -4701,7 +4994,7 @@ internal sealed class ToolUpdateForm : Form
             Multiline = true,
             ReadOnly = true,
             BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle,
-            Text = BuildInfo(status, repositoryRoot, remoteUrl),
+            Text = infoText,
         };
         root.Controls.Add(info, 0, 1);
 
@@ -4730,8 +5023,8 @@ internal sealed class ToolUpdateForm : Form
             Padding = new Padding(0, 8, 0, 0),
         };
         var closeButton = new Button { Text = "关闭", Width = 90, DialogResult = DialogResult.Cancel };
-        var updateButton = new Button { Text = "执行更新命令", Width = 120, Enabled = !string.IsNullOrWhiteSpace(repositoryRoot) };
-        var openLocalButton = new Button { Text = "打开本地目录", Width = 110, Enabled = !string.IsNullOrWhiteSpace(repositoryRoot) };
+        var updateButton = new Button { Text = updateButtonText, Width = 120, Enabled = updateEnabled };
+        var openLocalButton = new Button { Text = "打开本地目录", Width = 110, Enabled = !string.IsNullOrWhiteSpace(localDirectory) };
         var openGitHubButton = new Button { Text = "打开 GitHub", Width = 110, Enabled = !string.IsNullOrWhiteSpace(remoteUrl) };
 
         updateButton.Click += (_, _) =>
@@ -4742,9 +5035,9 @@ internal sealed class ToolUpdateForm : Form
         };
         openLocalButton.Click += (_, _) =>
         {
-            if (!string.IsNullOrWhiteSpace(_repositoryRoot) && Directory.Exists(_repositoryRoot))
+            if (!string.IsNullOrWhiteSpace(_localDirectory) && Directory.Exists(_localDirectory))
             {
-                Process.Start(new ProcessStartInfo("explorer.exe", _repositoryRoot) { UseShellExecute = true });
+                Process.Start(new ProcessStartInfo("explorer.exe", _localDirectory) { UseShellExecute = true });
             }
         };
         openGitHubButton.Click += (_, _) =>
@@ -4767,7 +5060,46 @@ internal sealed class ToolUpdateForm : Form
         Controls.Add(root);
     }
 
-    private static string BuildTitle(GitUpdateStatus? status, string? repositoryRoot)
+    public static ToolUpdateForm FromRelease(ReleaseUpdateStatus status)
+    {
+        var title = status.State switch
+        {
+            ReleaseUpdateState.UpdateAvailable => "检测到工具新版本",
+            ReleaseUpdateState.UpToDate => "工具已是最新版本",
+            ReleaseUpdateState.Unavailable => "无法检查工具更新",
+            _ => "工具更新状态未知",
+        };
+        var info =
+            $"当前版本：{status.CurrentVersion}{Environment.NewLine}" +
+            $"GitHub 最新：{(string.IsNullOrWhiteSpace(status.LatestTag) ? "未知" : status.LatestTag)}{Environment.NewLine}" +
+            $"下载文件：{(string.IsNullOrWhiteSpace(status.AssetName) ? "未找到" : status.AssetName)}{Environment.NewLine}" +
+            $"安装目录：{AppContext.BaseDirectory}";
+        var notes = status.State == ReleaseUpdateState.Unavailable
+            ? status.Message
+            : string.IsNullOrWhiteSpace(status.ReleaseNotes) ? "这个版本没有填写更新说明。" : status.ReleaseNotes;
+        return new ToolUpdateForm(
+            title,
+            info,
+            notes,
+            "下载并更新",
+            status.State == ReleaseUpdateState.UpdateAvailable && !string.IsNullOrWhiteSpace(status.AssetDownloadUrl),
+            AppContext.BaseDirectory,
+            string.IsNullOrWhiteSpace(status.ReleaseUrl) ? "https://github.com/HoodHou/External-git-DG-SVNManager/releases" : status.ReleaseUrl);
+    }
+
+    public static ToolUpdateForm FromGit(GitUpdateStatus? status, string? repositoryRoot, string remoteUrl, string updateLog)
+    {
+        return new ToolUpdateForm(
+            BuildGitTitle(status, repositoryRoot),
+            BuildGitInfo(status, repositoryRoot, remoteUrl),
+            string.IsNullOrWhiteSpace(updateLog) ? "暂无更新内容。" : updateLog,
+            "执行更新命令",
+            !string.IsNullOrWhiteSpace(repositoryRoot),
+            repositoryRoot,
+            remoteUrl);
+    }
+
+    private static string BuildGitTitle(GitUpdateStatus? status, string? repositoryRoot)
     {
         if (string.IsNullOrWhiteSpace(repositoryRoot))
         {
@@ -4783,7 +5115,7 @@ internal sealed class ToolUpdateForm : Form
         };
     }
 
-    private static string BuildInfo(GitUpdateStatus? status, string? repositoryRoot, string remoteUrl)
+    private static string BuildGitInfo(GitUpdateStatus? status, string? repositoryRoot, string remoteUrl)
     {
         if (string.IsNullOrWhiteSpace(repositoryRoot))
         {
