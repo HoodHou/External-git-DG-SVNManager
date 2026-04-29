@@ -2307,13 +2307,14 @@ try {{
 
     private void LoadAllFiles()
     {
+        var root = _workingCopyText.Text.Trim();
         var search = _fileTreeSearchText.Text.Trim();
         var changedOnly = _fileTreeChangedOnlyCheck.Checked;
         var isFiltering = changedOnly || !string.IsNullOrWhiteSpace(search);
         var expandedPaths = isFiltering ? new HashSet<string>(StringComparer.OrdinalIgnoreCase) : GetExpandedTreePaths();
-        if (expandedPaths.Count == 0)
+        if (expandedPaths.Count == 0 && !string.IsNullOrWhiteSpace(root))
         {
-            expandedPaths = _settings.GetExpandedPaths(CurrentWorkingCopyKey());
+            expandedPaths = _settings.GetExpandedPaths(root);
         }
 
         _loadingFileTree = true;
@@ -2321,7 +2322,6 @@ try {{
         _fileTree.Nodes.Clear();
         try
         {
-            var root = _workingCopyText.Text.Trim();
             if (!Directory.Exists(root))
             {
                 return;
@@ -8042,6 +8042,11 @@ internal sealed class AppSettings
 
     public HashSet<string> GetExpandedPaths(string workingCopyPath)
     {
+        if (string.IsNullOrWhiteSpace(workingCopyPath))
+        {
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+
         return ExpandedFileTreePaths.TryGetValue(NormalizeKey(workingCopyPath), out var paths)
             ? new HashSet<string>(paths, StringComparer.OrdinalIgnoreCase)
             : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -8063,6 +8068,11 @@ internal sealed class AppSettings
 
     private static bool PathEquals(string left, string right)
     {
+        if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
+        {
+            return string.Equals(left?.Trim(), right?.Trim(), StringComparison.OrdinalIgnoreCase);
+        }
+
         return string.Equals(
             Path.GetFullPath(left).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
             Path.GetFullPath(right).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
@@ -8071,6 +8081,11 @@ internal sealed class AppSettings
 
     private static string NormalizeKey(string path)
     {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return string.Empty;
+        }
+
         return Path.GetFullPath(path)
             .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
             .ToLowerInvariant();
