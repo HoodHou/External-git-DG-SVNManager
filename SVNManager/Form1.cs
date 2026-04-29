@@ -29,6 +29,7 @@ public partial class Form1 : Form
     private readonly TreeView _historyChangedFilesTree = new();
     private readonly Panel _historyDiffPanel = new();
     private readonly TabControl _mainTabs = new();
+    private readonly TabPage _configPage = new("配置");
     private readonly TabPage _statusPage = new("File Status");
     private readonly TabPage _conflictPage = new("冲突");
     private readonly TabPage _historyPage = new("History");
@@ -58,6 +59,7 @@ public partial class Form1 : Form
     private readonly AppSettings _settings;
     private bool _loadingRepository;
     private bool _loadingFileTree;
+    private bool _loadingCurrentTab;
     private bool _checkingToolUpdate;
     private bool _checkingRemote;
     private SvnLogEntry? _latestRemoteLog;
@@ -110,42 +112,12 @@ public partial class Form1 : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 4,
+            RowCount = 2,
             Padding = new Padding(12),
         };
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 108));
         Controls.Add(root);
-
-        var pathPanel = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 3,
-            RowCount = 2,
-        };
-        pathPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
-        pathPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        pathPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 116));
-        pathPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-        pathPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-        root.Controls.Add(pathPanel, 0, 0);
-
-        pathPanel.Controls.Add(new Label { Text = "SVN 地址", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 0, 0);
-        _repoUrlText.Dock = DockStyle.Fill;
-        pathPanel.Controls.Add(_repoUrlText, 1, 0);
-        _checkoutButton.Text = "检出";
-        _checkoutButton.Dock = DockStyle.Fill;
-        _checkoutButton.Click += async (_, _) => await RunCheckoutAsync();
-        pathPanel.Controls.Add(_checkoutButton, 2, 0);
-
-        pathPanel.Controls.Add(new Label { Text = "本地目录", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 0, 1);
-        _workingCopyText.Dock = DockStyle.Fill;
-        pathPanel.Controls.Add(_workingCopyText, 1, 1);
-        var chooseButton = new Button { Text = "选择", Dock = DockStyle.Fill };
-        chooseButton.Click += (_, _) => ChooseWorkingCopy();
-        pathPanel.Controls.Add(chooseButton, 2, 1);
 
         var toolbar = new FlowLayoutPanel
         {
@@ -155,7 +127,7 @@ public partial class Form1 : Form
             Padding = new Padding(0, 6, 0, 0),
             BackColor = Color.FromArgb(246, 248, 250),
         };
-        root.Controls.Add(toolbar, 0, 1);
+        root.Controls.Add(toolbar, 0, 0);
 
         _repositorySelector.Width = 250;
         _repositorySelector.DropDownStyle = ComboBoxStyle.DropDownList;
@@ -227,17 +199,29 @@ public partial class Form1 : Form
         _workspaceSplit.Dock = DockStyle.Fill;
         _workspaceSplit.SplitterDistance = 170;
         _workspaceSplit.FixedPanel = FixedPanel.Panel1;
-        root.Controls.Add(_workspaceSplit, 0, 2);
+        root.Controls.Add(_workspaceSplit, 0, 1);
+
+        var sidebarSplit = new SplitContainer
+        {
+            Dock = DockStyle.Fill,
+            Orientation = Orientation.Horizontal,
+            SplitterDistance = 170,
+            FixedPanel = FixedPanel.Panel1,
+        };
+        _workspaceSplit.Panel1.Controls.Add(sidebarSplit);
 
         _repositoryTree.Dock = DockStyle.Fill;
         ConfigureNavigationTree(_repositoryTree);
         _repositoryTree.ShowNodeToolTips = true;
         _repositoryTree.ImageList = _treeImages;
         _repositoryTree.AfterSelect += async (_, args) => await SelectSidebarRepositoryAsync(args.Node);
-        _workspaceSplit.Panel1.Controls.Add(_repositoryTree);
+        sidebarSplit.Panel1.Controls.Add(CreateTitledPanel("本地库", _repositoryTree));
         RefreshRepositoryTree();
 
         _mainTabs.Dock = DockStyle.Fill;
+        _configPage.Controls.Add(CreateConfigPanel());
+        _mainTabs.TabPages.Add(_configPage);
+
         _statusPage.Controls.Add(CreateStatusPanel());
         _mainTabs.TabPages.Add(_statusPage);
 
@@ -339,7 +323,7 @@ public partial class Form1 : Form
         _outputText.ScrollBars = ScrollBars.Both;
         _outputText.WordWrap = false;
         _outputText.BackColor = Color.FromArgb(250, 250, 250);
-        root.Controls.Add(_outputText, 0, 3);
+        sidebarSplit.Panel2.Controls.Add(CreateTitledPanel("终端输出", _outputText));
 
         var statusStrip = new StatusStrip();
         statusStrip.Items.Add(_statusLabel);
@@ -357,6 +341,77 @@ public partial class Form1 : Form
         _remoteCheckTimer.Interval = 180000;
         _remoteCheckTimer.Tick += async (_, _) => await CheckRemoteChangesAsync(showUpToDateMessage: false);
         ApplyControlStyle(this);
+    }
+
+    private Control CreateConfigPanel()
+    {
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            Padding = new Padding(14),
+            BackColor = Color.White,
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 92));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        var fields = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 3,
+            RowCount = 2,
+        };
+        fields.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 84));
+        fields.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        fields.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
+        fields.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+        fields.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+
+        fields.Controls.Add(new Label { Text = "SVN 地址", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 0, 0);
+        _repoUrlText.Dock = DockStyle.Fill;
+        fields.Controls.Add(_repoUrlText, 1, 0);
+        _checkoutButton.Text = "检出";
+        _checkoutButton.Dock = DockStyle.Fill;
+        _checkoutButton.Click += async (_, _) => await RunCheckoutAsync();
+        fields.Controls.Add(_checkoutButton, 2, 0);
+
+        fields.Controls.Add(new Label { Text = "本地目录", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 0, 1);
+        _workingCopyText.Dock = DockStyle.Fill;
+        fields.Controls.Add(_workingCopyText, 1, 1);
+        var chooseButton = new Button { Text = "选择", Dock = DockStyle.Fill };
+        chooseButton.Click += (_, _) => ChooseWorkingCopy();
+        fields.Controls.Add(chooseButton, 2, 1);
+        root.Controls.Add(CreateTitledPanel("当前库配置", fields), 0, 0);
+
+        var actions = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = true,
+            Padding = new Padding(0, 12, 0, 0),
+        };
+        actions.Controls.Add(CreateActionButton("保存库", SaveCurrentRepository, 92));
+        actions.Controls.Add(CreateActionButton("移除当前库", RemoveCurrentRepository, 104));
+        actions.Controls.Add(CreateActionButton("打开目录", OpenWorkingCopyFolder, 92));
+        actions.Controls.Add(CreateActionButton("设置", ShowSettingsDialog, 82));
+        root.Controls.Add(actions, 0, 1);
+
+        return root;
+    }
+
+    private static Button CreateActionButton(string text, Action action, int width)
+    {
+        var button = new Button
+        {
+            Text = text,
+            Width = width,
+            Height = 30,
+            Margin = new Padding(0, 0, 8, 8),
+        };
+        button.Click += (_, _) => action();
+        return button;
     }
 
     private static Control CreateTitledPanel(string title, Control content)
@@ -3808,17 +3863,43 @@ try {{
 
     private async Task LoadCurrentTabAsync()
     {
-        if (_mainTabs.SelectedTab?.Text == "全部文件")
+        if (_loadingCurrentTab)
         {
-            LoadAllFiles();
+            return;
         }
-        else if (IsTab(_mainTabs.SelectedTab, "冲突"))
+
+        _loadingCurrentTab = true;
+        try
         {
-            await RefreshStatusAsync();
+            if (IsTab(_mainTabs.SelectedTab, "全部文件"))
+            {
+                LoadAllFiles();
+            }
+            else if (IsTab(_mainTabs.SelectedTab, "File Status"))
+            {
+                if (ValidateWorkingCopyPathForBackground())
+                {
+                    await RefreshStatusAsync();
+                }
+            }
+            else if (IsTab(_mainTabs.SelectedTab, "冲突"))
+            {
+                if (ValidateWorkingCopyPathForBackground())
+                {
+                    await RefreshStatusAsync();
+                }
+            }
+            else if (IsTab(_mainTabs.SelectedTab, "History"))
+            {
+                if (ValidateWorkingCopyPathForBackground())
+                {
+                    await LoadRepositoryHistoryAsync();
+                }
+            }
         }
-        else if (IsTab(_mainTabs.SelectedTab, "History") && _historyList.Items.Count == 0)
+        finally
         {
-            await LoadRepositoryHistoryAsync();
+            _loadingCurrentTab = false;
         }
     }
 
