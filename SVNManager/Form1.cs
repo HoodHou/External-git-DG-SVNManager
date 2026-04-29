@@ -819,13 +819,9 @@ public partial class Form1 : Form
     private void LoadSettingsIntoUi()
     {
         _settings.MigrateLegacySettings();
-        _settings.AddKnownWorkingCopyIfExists(
-            "DG_lua trunk",
-            "svn://192.168.6.20:13690/xdqd_xml/trunk",
-            @"C:\Users\Administrator\Desktop\DG_lua\trunk");
         RefreshRepositorySelector();
         var selected = _settings.GetCurrentRepository();
-        _repoUrlText.Text = selected?.RepositoryUrl ?? "svn://192.168.6.20:13690/xdqd_xml/trunk";
+        _repoUrlText.Text = selected?.RepositoryUrl ?? "";
         _workingCopyText.Text = selected?.WorkingCopyPath ?? "";
         LoadAllFiles();
         SelectTab(string.IsNullOrWhiteSpace(_settings.UiLayout.SelectedTab) ? "History" : _settings.UiLayout.SelectedTab);
@@ -3897,7 +3893,7 @@ try {{
         UpdateHistoryBadge(0);
         _historyDetailText.Clear();
         var selected = _settings.GetCurrentRepository();
-        _repoUrlText.Text = selected?.RepositoryUrl ?? "svn://192.168.6.20:13690/xdqd_xml/trunk";
+        _repoUrlText.Text = selected?.RepositoryUrl ?? "";
         _workingCopyText.Text = selected?.WorkingCopyPath ?? "";
         _changesList.Items.Clear();
         LoadAllFiles();
