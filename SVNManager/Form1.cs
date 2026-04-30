@@ -25,6 +25,10 @@ public partial class Form1 : Form
     private readonly Button _fileTreeRefreshButton = new();
     private readonly ListView _historyList = new();
     private readonly TextBox _historySearchText = new();
+    private readonly Label _historySearchScopeLabel = new();
+    private readonly Button _historyDeepSearchButton = new();
+    private readonly Button _historyLoadMoreButton = new();
+    private readonly Button _historyClearSearchButton = new();
     private readonly TextBox _historyDetailText = new();
     private readonly TreeView _historyChangedFilesTree = new();
     private readonly Panel _historyDiffPanel = new();
@@ -72,9 +76,14 @@ public partial class Form1 : Form
     private SvnLogEntry? _selectedHistoryLog;
     private List<SvnLogEntry> _selectedHistoryLogs = [];
     private List<SvnLogEntry> _historyRows = [];
+    private int _historyLoadedLimit = InitialHistoryLimit;
     private List<SvnChange> _currentConflicts = [];
     private readonly Dictionary<string, DiffPreviewData> _historyDiffPreviewCache = new(StringComparer.Ordinal);
     private CancellationTokenSource? _historyDiffPreviewCts;
+    private const int InitialHistoryLimit = 80;
+    private const int HistoryLoadMoreStep = 200;
+    private const int HistoryDeepSearchLimit = 1000;
+    private const int HistoryRevisionRangeLimit = 5000;
     private const int MaxDiffPreviewCacheEntries = 40;
 
     public Form1()
@@ -273,13 +282,54 @@ public partial class Form1 : Form
             ColumnCount = 1,
             RowCount = 2,
         };
-        historyListPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        historyListPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
         historyListPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        var historySearchPanel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 5,
+            RowCount = 1,
+        };
+        historySearchPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        historySearchPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
+        historySearchPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+        historySearchPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+        historySearchPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72));
         _historySearchText.Dock = DockStyle.Fill;
         _historySearchText.PlaceholderText = "搜索：file:文件 author:作者 rev:57100-57120 id:需求号 或普通关键词";
-        _historySearchText.Margin = new Padding(0, 0, 0, 4);
+        _historySearchText.Margin = new Padding(0, 4, 6, 4);
         _historySearchText.TextChanged += (_, _) => ApplyHistoryFilter();
-        historyListPanel.Controls.Add(_historySearchText, 0, 0);
+        _historySearchText.KeyDown += async (_, args) =>
+        {
+            if (args.KeyCode != Keys.Enter)
+            {
+                return;
+            }
+
+            args.SuppressKeyPress = true;
+            await RunDeepHistorySearchAsync();
+        };
+        historySearchPanel.Controls.Add(_historySearchText, 0, 0);
+
+        _historySearchScopeLabel.Dock = DockStyle.Fill;
+        _historySearchScopeLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _historySearchScopeLabel.ForeColor = Color.FromArgb(90, 100, 115);
+        _historySearchScopeLabel.Text = "已加载 0 条";
+        historySearchPanel.Controls.Add(_historySearchScopeLabel, 1, 0);
+
+        ConfigureHistorySearchButton(_historyDeepSearchButton, "深度搜索");
+        _historyDeepSearchButton.Click += async (_, _) => await RunDeepHistorySearchAsync();
+        historySearchPanel.Controls.Add(_historyDeepSearchButton, 2, 0);
+
+        ConfigureHistorySearchButton(_historyLoadMoreButton, "加载更多");
+        _historyLoadMoreButton.Click += async (_, _) => await LoadMoreRepositoryHistoryAsync();
+        historySearchPanel.Controls.Add(_historyLoadMoreButton, 3, 0);
+
+        ConfigureHistorySearchButton(_historyClearSearchButton, "清空");
+        _historyClearSearchButton.Click += (_, _) => _historySearchText.Clear();
+        historySearchPanel.Controls.Add(_historyClearSearchButton, 4, 0);
+
+        historyListPanel.Controls.Add(historySearchPanel, 0, 0);
 
         _historyList.Dock = DockStyle.Fill;
         _historyList.View = View.Details;
@@ -938,6 +988,13 @@ public partial class Form1 : Form
             Dock = DockStyle.Fill,
             Margin = new Padding(0, 3, 6, 3),
         };
+    }
+
+    private static void ConfigureHistorySearchButton(Button button, string text)
+    {
+        button.Text = text;
+        button.Dock = DockStyle.Fill;
+        button.Margin = new Padding(0, 4, 6, 4);
     }
 
     private static Control CreatePanelToolbar(string title, string buttonText, Func<Task> refresh)
@@ -2707,23 +2764,93 @@ try {{
             : $"已打开历史窗口：{label}（{logs.Count} 条）");
     }
 
-    private async Task LoadRepositoryHistoryAsync()
+    private async Task LoadRepositoryHistoryAsync(int? limit = null)
     {
         if (!ValidateWorkingCopyPath())
         {
             return;
         }
 
+        var requestedLimit = Math.Max(InitialHistoryLimit, limit ?? _historyLoadedLimit);
+        _historyLoadedLimit = requestedLimit;
         ClearHistoryDiffPreviewCache();
-        SetBusy(true, "正在读取仓库历史...");
+        SetBusy(true, $"正在读取仓库历史（最近 {requestedLimit} 条）...");
         try
         {
-            var logs = await _svn.GetRepositoryLogAsync(_workingCopyText.Text.Trim(), 80);
+            var logs = await _svn.GetRepositoryLogAsync(_workingCopyText.Text.Trim(), requestedLimit);
             _latestRemoteLog = logs.FirstOrDefault(log => !log.IsUncommitted);
             FillHistoryList(logs);
             UpdateHistoryBadge(logs.Count);
-            WriteOutput(logs.Count == 0 ? "没有读取到仓库历史。" : $"已读取 {logs.Count} 条仓库历史。");
+            WriteOutput(logs.Count == 0 ? "没有读取到仓库历史。" : $"已读取最近 {logs.Count} 条仓库历史。");
             await CheckRemoteChangesAsync(showUpToDateMessage: false);
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private async Task LoadMoreRepositoryHistoryAsync()
+    {
+        var nextLimit = _historyLoadedLimit + HistoryLoadMoreStep;
+        await LoadRepositoryHistoryAsync(nextLimit);
+    }
+
+    private async Task RunDeepHistorySearchAsync()
+    {
+        if (!ValidateWorkingCopyPath())
+        {
+            return;
+        }
+
+        var filter = HistorySearchFilter.Parse(_historySearchText.Text);
+        if (filter.HasRevisionRange)
+        {
+            await LoadRepositoryHistoryRevisionRangeAsync(filter);
+            return;
+        }
+
+        var targetLimit = Math.Max(_historyLoadedLimit, HistoryDeepSearchLimit);
+        await LoadRepositoryHistoryAsync(targetLimit);
+        ApplyHistoryFilter();
+        WriteOutput(string.IsNullOrWhiteSpace(_historySearchText.Text)
+            ? $"深度搜索已读取最近 {_historyRows.Count(log => !log.IsUncommitted)} 条历史。"
+            : $"深度搜索已读取最近 {_historyRows.Count(log => !log.IsUncommitted)} 条历史，当前匹配 {_historyList.Items.Count} 条。");
+    }
+
+    private async Task LoadRepositoryHistoryRevisionRangeAsync(HistorySearchFilter filter)
+    {
+        if (filter.RevisionStart == null && filter.RevisionEnd == null)
+        {
+            return;
+        }
+
+        var start = filter.RevisionStart ?? filter.RevisionEnd!.Value;
+        var end = filter.RevisionEnd ?? filter.RevisionStart!.Value;
+        var rangeLimit = (int)Math.Min(HistoryRevisionRangeLimit, Math.Max(1, Math.Abs(end - start) + 1));
+
+        ClearHistoryDiffPreviewCache();
+        SetBusy(true, $"正在读取版本范围 r{start}-r{end}...");
+        try
+        {
+            var rangeLogs = await _svn.GetRepositoryLogRangeAsync(_workingCopyText.Text.Trim(), start, end, rangeLimit);
+            var mergedLogs = _historyRows
+                .Where(log => !log.IsUncommitted)
+                .Concat(rangeLogs)
+                .GroupBy(log => log.Revision)
+                .Select(group => group.OrderByDescending(log => log.ChangedFiles.Count).First())
+                .OrderByDescending(log => log.Revision)
+                .ToList();
+            FillHistoryList(mergedLogs);
+            UpdateHistoryBadge(mergedLogs.Count);
+            ApplyHistoryFilter();
+            WriteOutput(
+                $"深度搜索已读取版本范围 r{Math.Min(start, end)}-r{Math.Max(start, end)}，新增/合并 {rangeLogs.Count} 条历史，当前匹配 {_historyList.Items.Count} 条。" +
+                (Math.Abs(end - start) + 1 > HistoryRevisionRangeLimit ? $" 当前最多读取 {HistoryRevisionRangeLimit} 条，请缩小版本范围。" : ""));
         }
         catch (Exception ex)
         {
@@ -3769,7 +3896,7 @@ try {{
             _historyRows.Add(uncommitted);
         }
 
-        foreach (var log in logs)
+        foreach (var log in logs.OrderByDescending(log => log.Revision))
         {
             _historyRows.Add(log with { IsWorkingCopyRevision = log.Revision == info.MaxRevision });
         }
@@ -3790,11 +3917,15 @@ try {{
             AddHistoryItem(row);
         }
         _historyList.EndUpdate();
+        UpdateHistorySearchControls();
 
         if (_historyList.Items.Count == 0)
         {
             _selectedHistoryLog = null;
-            ShowHistorySummary(filter.IsEmpty ? "" : "没有匹配的提交。");
+            var loadedCount = _historyRows.Count(log => !log.IsUncommitted);
+            ShowHistorySummary(filter.IsEmpty
+                ? ""
+                : $"没有匹配的提交。当前只在已加载的 {loadedCount} 条历史里搜索；可以点击“深度搜索”读取更早提交。");
             return;
         }
 
@@ -3805,6 +3936,21 @@ try {{
         itemToSelect.Selected = true;
         itemToSelect.Focused = true;
         itemToSelect.EnsureVisible();
+    }
+
+    private void UpdateHistorySearchControls()
+    {
+        var filter = HistorySearchFilter.Parse(_historySearchText.Text);
+        var loadedCount = _historyRows.Count(log => !log.IsUncommitted);
+        var matchedCount = _historyList.Items.Count;
+        _historySearchScopeLabel.Text = filter.IsEmpty
+            ? $"已加载 {loadedCount} 条"
+            : $"匹配 {matchedCount}/{loadedCount} 条";
+
+        var canUseHistory = !UseWaitCursor && ValidateWorkingCopyPathForBackground();
+        _historyLoadMoreButton.Enabled = canUseHistory;
+        _historyDeepSearchButton.Enabled = canUseHistory;
+        _historyClearSearchButton.Enabled = !string.IsNullOrWhiteSpace(_historySearchText.Text);
     }
 
     private void AddHistoryItem(SvnLogEntry log)
@@ -3907,6 +4053,9 @@ try {{
         _historyListMenu.Items.Add("定位本次改动文件", null, (_, _) => FocusFirstChangedFileInSelectedHistory());
         _historyListMenu.Items.Add("回退工作副本到此版本...", null, async (_, _) => await RunUpdateWorkingCopyToSelectedHistoryRevisionAsync());
         _historyListMenu.Items.Add(new ToolStripSeparator());
+        _historyListMenu.Items.Add("深度搜索当前条件", null, async (_, _) => await RunDeepHistorySearchAsync());
+        _historyListMenu.Items.Add("加载更多历史", null, async (_, _) => await LoadMoreRepositoryHistoryAsync());
+        _historyListMenu.Items.Add(new ToolStripSeparator());
         _historyListMenu.Items.Add("复制版本号", null, (_, _) => CopySelectedHistoryRevision());
         _historyListMenu.Items.Add("刷新历史", null, async (_, _) => await LoadRepositoryHistoryAsync());
         _historyListMenu.Opening += (_, args) =>
@@ -3915,7 +4064,10 @@ try {{
             var hasCommittedRevision = log != null && !log.IsUncommitted && log.Revision > 0;
             foreach (ToolStripItem item in _historyListMenu.Items)
             {
-                item.Enabled = hasCommittedRevision || item.Text == "刷新历史";
+                item.Enabled = hasCommittedRevision ||
+                    item.Text == "刷新历史" ||
+                    item.Text == "加载更多历史" ||
+                    item.Text == "深度搜索当前条件";
             }
         };
     }
@@ -4027,6 +4179,7 @@ try {{
         _changesList.Items.Clear();
         RefreshConflictPanel([]);
         UpdateStatusBadges(0, 0);
+        _historyLoadedLimit = InitialHistoryLimit;
         _historyList.Items.Clear();
         UpdateHistoryBadge(0);
         _historyDetailText.Clear();
@@ -4797,12 +4950,14 @@ try {{
         _changesList.Items.Clear();
         RefreshConflictPanel([]);
         UpdateStatusBadges(0, 0);
+        _historyLoadedLimit = InitialHistoryLimit;
         _historyList.Items.Clear();
         _historyRows.Clear();
         UpdateHistoryBadge(0);
         _historyDetailText.Clear();
         _historyChangedFilesTree.Nodes.Clear();
         _historyDiffPanel.Controls.Clear();
+        UpdateHistorySearchControls();
         LoadAllFiles();
     }
 
@@ -4828,7 +4983,14 @@ try {{
         _externalMergeButton.Enabled = !busy;
         _conflictWorkflowButton.Enabled = !busy;
         _historyButton.Enabled = !busy;
+        _historyDeepSearchButton.Enabled = !busy;
+        _historyLoadMoreButton.Enabled = !busy;
+        _historyClearSearchButton.Enabled = !busy && !string.IsNullOrWhiteSpace(_historySearchText.Text);
         UseWaitCursor = busy;
+        if (!busy)
+        {
+            UpdateHistorySearchControls();
+        }
     }
 
     private void WriteOutput(string output)
@@ -6313,6 +6475,24 @@ internal sealed class SvnClient
         return ParseTextLogEntries(result.StandardOutput);
     }
 
+    public async Task<IReadOnlyList<SvnLogEntry>> GetRepositoryLogRangeAsync(string workingCopyPath, long revisionStart, long revisionEnd, int limit)
+    {
+        var start = Math.Min(revisionStart, revisionEnd);
+        var end = Math.Max(revisionStart, revisionEnd);
+        var result = await RunTextAsync(workingCopyPath, "log", "-v", "-r", $"{end}:{start}", "--limit", limit.ToString());
+        if (result.ExitCode != 0)
+        {
+            throw new InvalidOperationException(result.CombinedOutput);
+        }
+
+        if (string.IsNullOrWhiteSpace(result.StandardOutput))
+        {
+            return Array.Empty<SvnLogEntry>();
+        }
+
+        return ParseTextLogEntries(result.StandardOutput);
+    }
+
     public async Task<SvnLogEntry?> GetLatestRepositoryLogAsync(string workingCopyPath)
     {
         var logs = await GetRepositoryLogAsync(workingCopyPath, 1);
@@ -7601,6 +7781,7 @@ internal sealed class HistorySearchFilter
     public string IssueId { get; private init; } = "";
     public long? RevisionStart { get; private init; }
     public long? RevisionEnd { get; private init; }
+    public bool HasRevisionRange => RevisionStart != null || RevisionEnd != null;
 
     public bool IsEmpty =>
         string.IsNullOrWhiteSpace(Keyword) &&
