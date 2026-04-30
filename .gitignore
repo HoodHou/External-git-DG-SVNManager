@@ -10,3 +10,5 @@ obj/
 TestResults/
 *.nupkg
 artifacts/
+SVNManager/ExternalTools/
+SVNManager/diagnostic.log

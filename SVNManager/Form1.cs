@@ -85,7 +85,15 @@ public partial class Form1 : Form
         Shown += async (_, _) =>
         {
             RestoreUiLayout();
-            await LoadRepositoryHistoryAsync();
+            await RunStartupEnvironmentCheckAsync();
+            if (ValidateWorkingCopyPathForBackground())
+            {
+                await LoadRepositoryHistoryAsync();
+            }
+            else
+            {
+                WriteOutput("请先在“配置”页导入已有工作副本，或检出一个新的 SVN 库。");
+            }
             _remoteCheckTimer.Start();
             await CheckToolUpdatesAsync(showUpToDateMessage: false);
             await CheckRemoteChangesAsync(showUpToDateMessage: false);
@@ -405,6 +413,7 @@ public partial class Form1 : Form
         actions.Controls.Add(CreateActionButton("移除当前库", RemoveCurrentRepository, 104));
         actions.Controls.Add(CreateActionButton("管理本地库", ShowRepositoryManagerDialog, 104));
         actions.Controls.Add(CreateActionButton("打开目录", OpenWorkingCopyFolder, 92));
+        actions.Controls.Add(CreateActionButton("环境检测", async () => await ShowEnvironmentCheckAsync(), 92));
         actions.Controls.Add(CreateActionButton("设置", ShowSettingsDialog, 82));
         root.Controls.Add(actions, 0, 1);
 
@@ -506,6 +515,7 @@ public partial class Form1 : Form
         _moreActionsMenu.Items.Clear();
         _moreActionsMenu.Items.Add("设置", null, (_, _) => ShowSettingsDialog());
         _moreActionsMenu.Items.Add("本地库管理", null, (_, _) => ShowRepositoryManagerDialog());
+        _moreActionsMenu.Items.Add("环境检测", null, async (_, _) => await ShowEnvironmentCheckAsync());
         _moreActionsMenu.Items.Add(new ToolStripSeparator());
         _moreActionsMenu.Items.Add("查看改动", null, async (_, _) => await RefreshStatusAsync());
         _moreActionsMenu.Items.Add("查看差异", null, async (_, _) => await RunDiffAsync());
@@ -549,6 +559,180 @@ public partial class Form1 : Form
         RefreshRepositorySelector();
         ApplyCurrentRepositoryToUi();
         WriteOutput("已更新本地库列表。");
+    }
+
+    private async Task ShowEnvironmentCheckAsync()
+    {
+        SetBusy(true, "正在执行环境检测...");
+        try
+        {
+            var items = await BuildEnvironmentCheckItemsAsync();
+            using var form = new EnvironmentCheckForm(items);
+            form.ShowDialog(this);
+            WriteEnvironmentCheckSummary(items);
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        finally
+        {
+            SetBusy(false, "就绪");
+        }
+    }
+
+    private async Task RunStartupEnvironmentCheckAsync()
+    {
+        try
+        {
+            var items = await BuildEnvironmentCheckItemsAsync();
+            WriteEnvironmentCheckSummary(items, onlyWhenHasIssues: true);
+        }
+        catch (Exception ex)
+        {
+            WriteOutput("环境检测失败：" + ex.Message);
+        }
+    }
+
+    private async Task<IReadOnlyList<EnvironmentCheckItem>> BuildEnvironmentCheckItemsAsync()
+    {
+        var items = new List<EnvironmentCheckItem>();
+        await CheckSvnCommandAsync(items);
+        CheckSavedRepository(items);
+        await CheckWorkingCopyAsync(items);
+        CheckExternalMergeTool(items);
+        CheckInstallDirectoryWritable(items);
+        CheckOperationLogWritable(items);
+        return items;
+    }
+
+    private async Task CheckSvnCommandAsync(List<EnvironmentCheckItem> items)
+    {
+        try
+        {
+            var result = await _svn.VersionAsync();
+            if (result.ExitCode == 0 && !string.IsNullOrWhiteSpace(result.StandardOutput))
+            {
+                items.Add(EnvironmentCheckItem.Ok("SVN 命令", $"svn {result.StandardOutput.Trim()}", "SVN 命令行可用。"));
+                return;
+            }
+
+            items.Add(EnvironmentCheckItem.Error("SVN 命令", "svn 命令执行失败", result.CombinedOutput.Trim()));
+        }
+        catch (Exception ex)
+        {
+            items.Add(EnvironmentCheckItem.Error(
+                "SVN 命令",
+                "找不到 svn 命令行",
+                "请安装 TortoiseSVN 时勾选 command line tools，或安装 Apache Subversion，并确认 svn.exe 在 PATH 中。" + Environment.NewLine + ex.Message));
+        }
+    }
+
+    private void CheckSavedRepository(List<EnvironmentCheckItem> items)
+    {
+        var repository = _settings.GetCurrentRepository();
+        if (repository == null)
+        {
+            items.Add(EnvironmentCheckItem.Warning("本地库", "还没有保存本地库", "请在配置页导入已有 SVN 工作副本，或检出一个新库。"));
+            return;
+        }
+
+        items.Add(EnvironmentCheckItem.Ok("本地库", repository.Name, repository.WorkingCopyPath));
+    }
+
+    private async Task CheckWorkingCopyAsync(List<EnvironmentCheckItem> items)
+    {
+        var workingCopy = _workingCopyText.Text.Trim();
+        if (string.IsNullOrWhiteSpace(workingCopy))
+        {
+            items.Add(EnvironmentCheckItem.Warning("工作副本", "未选择本地目录", "请选择一个包含 .svn 的工作副本目录。"));
+            return;
+        }
+
+        if (!Directory.Exists(workingCopy))
+        {
+            items.Add(EnvironmentCheckItem.Error("工作副本", "本地目录不存在", workingCopy));
+            return;
+        }
+
+        if (!Directory.Exists(Path.Combine(workingCopy, ".svn")))
+        {
+            items.Add(EnvironmentCheckItem.Error("工作副本", "不是 SVN 工作副本", "目录存在，但没有找到 .svn：" + workingCopy));
+            return;
+        }
+
+        try
+        {
+            var info = await Task.Run(() => _svn.GetWorkingCopyInfo(workingCopy));
+            var detail = info == WorkingCopyInfo.Empty
+                ? workingCopy
+                : $"{info.DisplayRevisionText}  {info.Url}";
+            items.Add(EnvironmentCheckItem.Ok("工作副本", "SVN 工作副本正常", detail));
+        }
+        catch (Exception ex)
+        {
+            items.Add(EnvironmentCheckItem.Error("工作副本", "SVN 信息读取失败", ex.Message));
+        }
+    }
+
+    private void CheckExternalMergeTool(List<EnvironmentCheckItem> items)
+    {
+        if (string.IsNullOrWhiteSpace(_settings.ExternalMergeToolPath))
+        {
+            items.Add(EnvironmentCheckItem.Warning("分久必合", "未配置外部合并工具", "XML 表格仍可看内置差异，但冲突合并建议在“更多操作 -> 设置”中配置分久必合.exe。"));
+            return;
+        }
+
+        if (File.Exists(_settings.ExternalMergeToolPath))
+        {
+            items.Add(EnvironmentCheckItem.Ok("分久必合", "外部合并工具可用", _settings.ExternalMergeToolPath));
+            return;
+        }
+
+        items.Add(EnvironmentCheckItem.Error("分久必合", "配置的路径不存在", _settings.ExternalMergeToolPath));
+    }
+
+    private static void CheckInstallDirectoryWritable(List<EnvironmentCheckItem> items)
+    {
+        var directory = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var testPath = Path.Combine(directory, $".write-test-{Guid.NewGuid():N}.tmp");
+        try
+        {
+            File.WriteAllText(testPath, "test");
+            File.Delete(testPath);
+            items.Add(EnvironmentCheckItem.Ok("安装目录", "可写", directory));
+        }
+        catch (Exception ex)
+        {
+            items.Add(EnvironmentCheckItem.Warning("安装目录", "当前目录不可写，自动更新可能失败", $"{directory}{Environment.NewLine}{ex.Message}"));
+        }
+    }
+
+    private static void CheckOperationLogWritable(List<EnvironmentCheckItem> items)
+    {
+        try
+        {
+            var logPath = OperationLogger.EnsureLogFile();
+            items.Add(EnvironmentCheckItem.Ok("操作日志", "可写", logPath));
+        }
+        catch (Exception ex)
+        {
+            items.Add(EnvironmentCheckItem.Warning("操作日志", "日志目录不可写", ex.Message));
+        }
+    }
+
+    private void WriteEnvironmentCheckSummary(IReadOnlyList<EnvironmentCheckItem> items, bool onlyWhenHasIssues = false)
+    {
+        var errors = items.Count(item => item.Level == EnvironmentCheckLevel.Error);
+        var warnings = items.Count(item => item.Level == EnvironmentCheckLevel.Warning);
+        if (onlyWhenHasIssues && errors == 0 && warnings == 0)
+        {
+            return;
+        }
+
+        WriteOutput(errors == 0 && warnings == 0
+            ? "环境检测通过。"
+            : $"环境检测发现 {errors} 个错误、{warnings} 个提醒。请在“更多操作 -> 环境检测”查看详情。");
     }
 
     private void OpenOperationLog()
@@ -5625,6 +5809,11 @@ internal sealed class ToolUpdateForm : Form
 
 internal sealed class SvnClient
 {
+    public Task<ProcessResult> VersionAsync()
+    {
+        return RunTextAsync(null, "--version", "--quiet");
+    }
+
     public Task<ProcessResult> CheckoutAsync(string repositoryUrl, string workingCopyPath)
     {
         return RunAsync(null, "checkout", repositoryUrl, workingCopyPath);
@@ -7957,6 +8146,117 @@ internal sealed class RepositoryManagerForm : Form
 
         Process.Start(new ProcessStartInfo("explorer.exe", repository.WorkingCopyPath) { UseShellExecute = true });
     }
+}
+
+internal sealed class EnvironmentCheckForm : Form
+{
+    private readonly DataGridView _grid = new();
+    private readonly IReadOnlyList<EnvironmentCheckItem> _items;
+
+    public EnvironmentCheckForm(IReadOnlyList<EnvironmentCheckItem> items)
+    {
+        _items = items;
+        Text = "环境检测";
+        StartPosition = FormStartPosition.CenterParent;
+        MinimumSize = new Size(860, 460);
+        Size = new Size(980, 560);
+        Font = new Font("Microsoft YaHei UI", 9F);
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 3,
+            Padding = new Padding(12),
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        Controls.Add(root);
+
+        var errors = items.Count(item => item.Level == EnvironmentCheckLevel.Error);
+        var warnings = items.Count(item => item.Level == EnvironmentCheckLevel.Warning);
+        root.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Font = new Font(Font, FontStyle.Bold),
+            ForeColor = errors > 0 ? Color.DarkRed : warnings > 0 ? Color.FromArgb(166, 103, 34) : Color.FromArgb(45, 100, 65),
+            Text = errors == 0 && warnings == 0
+                ? "环境检测通过"
+                : $"环境检测发现 {errors} 个错误、{warnings} 个提醒",
+        }, 0, 0);
+
+        _grid.Dock = DockStyle.Fill;
+        _grid.AutoGenerateColumns = false;
+        _grid.AllowUserToAddRows = false;
+        _grid.AllowUserToDeleteRows = false;
+        _grid.ReadOnly = true;
+        _grid.RowHeadersVisible = false;
+        _grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+        _grid.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.AllCells;
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "项目", DataPropertyName = nameof(EnvironmentCheckItem.Name), Width = 120 });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "状态", DataPropertyName = nameof(EnvironmentCheckItem.Status), Width = 120 });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "说明", DataPropertyName = nameof(EnvironmentCheckItem.Detail), Width = 360, DefaultCellStyle = new DataGridViewCellStyle { WrapMode = DataGridViewTriState.True } });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "建议", DataPropertyName = nameof(EnvironmentCheckItem.Suggestion), AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, DefaultCellStyle = new DataGridViewCellStyle { WrapMode = DataGridViewTriState.True } });
+        _grid.DataSource = items.ToList();
+        _grid.DataBindingComplete += (_, _) => ApplyRowStyles();
+        root.Controls.Add(_grid, 0, 1);
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+        };
+        var closeButton = new Button { Text = "关闭", Width = 86, DialogResult = DialogResult.OK };
+        buttons.Controls.Add(closeButton);
+        root.Controls.Add(buttons, 0, 2);
+        AcceptButton = closeButton;
+    }
+
+    private void ApplyRowStyles()
+    {
+        foreach (DataGridViewRow row in _grid.Rows)
+        {
+            if (row.Index < 0 || row.Index >= _items.Count)
+            {
+                continue;
+            }
+
+            var item = _items[row.Index];
+            row.DefaultCellStyle.ForeColor = item.Level switch
+            {
+                EnvironmentCheckLevel.Error => Color.DarkRed,
+                EnvironmentCheckLevel.Warning => Color.FromArgb(166, 103, 34),
+                _ => Color.FromArgb(45, 100, 65),
+            };
+        }
+    }
+}
+
+internal sealed record EnvironmentCheckItem(string Name, string Status, string Detail, string Suggestion, EnvironmentCheckLevel Level)
+{
+    public static EnvironmentCheckItem Ok(string name, string status, string detail)
+    {
+        return new EnvironmentCheckItem(name, status, detail, "", EnvironmentCheckLevel.Ok);
+    }
+
+    public static EnvironmentCheckItem Warning(string name, string status, string suggestion)
+    {
+        return new EnvironmentCheckItem(name, status, "", suggestion, EnvironmentCheckLevel.Warning);
+    }
+
+    public static EnvironmentCheckItem Error(string name, string status, string suggestion)
+    {
+        return new EnvironmentCheckItem(name, status, "", suggestion, EnvironmentCheckLevel.Error);
+    }
+}
+
+internal enum EnvironmentCheckLevel
+{
+    Ok,
+    Warning,
+    Error,
 }
 
 internal sealed class TextPromptForm : Form
