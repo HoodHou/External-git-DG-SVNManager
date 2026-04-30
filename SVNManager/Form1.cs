@@ -138,6 +138,10 @@ public partial class Form1 : Form
         importRepositoryButton.Click += (_, _) => SelectTab("配置");
         toolbar.Controls.Add(importRepositoryButton);
 
+        var manageRepositoryButton = new Button { Text = "管理本地库", Width = 110 };
+        manageRepositoryButton.Click += (_, _) => ShowRepositoryManagerDialog();
+        toolbar.Controls.Add(manageRepositoryButton);
+
         var saveRepositoryButton = new Button { Text = "保存库", Width = 82 };
         saveRepositoryButton.Click += (_, _) => SaveCurrentRepository();
         toolbar.Controls.Add(saveRepositoryButton);
@@ -399,6 +403,7 @@ public partial class Form1 : Form
         actions.Controls.Add(CreateActionButton("导入已有工作副本", ChooseWorkingCopy, 132));
         actions.Controls.Add(CreateActionButton("保存当前库", SaveCurrentRepository, 104));
         actions.Controls.Add(CreateActionButton("移除当前库", RemoveCurrentRepository, 104));
+        actions.Controls.Add(CreateActionButton("管理本地库", ShowRepositoryManagerDialog, 104));
         actions.Controls.Add(CreateActionButton("打开目录", OpenWorkingCopyFolder, 92));
         actions.Controls.Add(CreateActionButton("设置", ShowSettingsDialog, 82));
         root.Controls.Add(actions, 0, 1);
@@ -500,6 +505,7 @@ public partial class Form1 : Form
     {
         _moreActionsMenu.Items.Clear();
         _moreActionsMenu.Items.Add("设置", null, (_, _) => ShowSettingsDialog());
+        _moreActionsMenu.Items.Add("本地库管理", null, (_, _) => ShowRepositoryManagerDialog());
         _moreActionsMenu.Items.Add(new ToolStripSeparator());
         _moreActionsMenu.Items.Add("查看改动", null, async (_, _) => await RefreshStatusAsync());
         _moreActionsMenu.Items.Add("查看差异", null, async (_, _) => await RunDiffAsync());
@@ -528,6 +534,21 @@ public partial class Form1 : Form
         WriteOutput(string.IsNullOrWhiteSpace(_settings.ExternalMergeToolPath)
             ? "已清空分久必合路径。"
             : $"已保存分久必合路径：{_settings.ExternalMergeToolPath}");
+    }
+
+    private void ShowRepositoryManagerDialog()
+    {
+        using var form = new RepositoryManagerForm(_settings, _svn);
+        form.ShowDialog(this);
+        if (!form.Changed)
+        {
+            return;
+        }
+
+        _settings.Save();
+        RefreshRepositorySelector();
+        ApplyCurrentRepositoryToUi();
+        WriteOutput("已更新本地库列表。");
     }
 
     private void OpenOperationLog()
@@ -4368,17 +4389,7 @@ try {{
 
         _settings.Save();
         RefreshRepositorySelector();
-        RefreshConflictPanel([]);
-        UpdateStatusBadges(0, 0);
-        _historyList.Items.Clear();
-        _historyRows.Clear();
-        UpdateHistoryBadge(0);
-        _historyDetailText.Clear();
-        var selected = _settings.GetCurrentRepository();
-        _repoUrlText.Text = selected?.RepositoryUrl ?? "";
-        _workingCopyText.Text = selected?.WorkingCopyPath ?? "";
-        _changesList.Items.Clear();
-        LoadAllFiles();
+        ApplyCurrentRepositoryToUi();
         WriteOutput($"已从本地库列表移除：{repository.Name}");
     }
 
@@ -4485,10 +4496,16 @@ try {{
         }
 
         _settings.CurrentRepositoryId = repository.Id;
-        _repoUrlText.Text = repository.RepositoryUrl;
-        _workingCopyText.Text = repository.WorkingCopyPath;
         _settings.Save();
         RefreshRepositoryTree();
+        ApplyCurrentRepositoryToUi();
+    }
+
+    private void ApplyCurrentRepositoryToUi()
+    {
+        var selected = _settings.GetCurrentRepository();
+        _repoUrlText.Text = selected?.RepositoryUrl ?? "";
+        _workingCopyText.Text = selected?.WorkingCopyPath ?? "";
         _changesList.Items.Clear();
         RefreshConflictPanel([]);
         UpdateStatusBadges(0, 0);
@@ -4496,6 +4513,8 @@ try {{
         _historyRows.Clear();
         UpdateHistoryBadge(0);
         _historyDetailText.Clear();
+        _historyChangedFilesTree.Nodes.Clear();
+        _historyDiffPanel.Controls.Clear();
         LoadAllFiles();
     }
 
@@ -7690,6 +7709,321 @@ internal sealed class CleanupOptionsForm : Form
 
         AcceptButton = ok;
         CancelButton = cancel;
+    }
+}
+
+internal sealed class RepositoryManagerForm : Form
+{
+    private readonly AppSettings _settings;
+    private readonly SvnClient _svn;
+    private readonly ListView _list = new();
+    private readonly Label _summaryLabel = new();
+
+    public RepositoryManagerForm(AppSettings settings, SvnClient svn)
+    {
+        _settings = settings;
+        _svn = svn;
+        Text = "本地库管理";
+        StartPosition = FormStartPosition.CenterParent;
+        MinimumSize = new Size(920, 460);
+        Size = new Size(1080, 560);
+        Font = new Font("Microsoft YaHei UI", 9F);
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 3,
+            Padding = new Padding(12),
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        Controls.Add(root);
+
+        _summaryLabel.Dock = DockStyle.Fill;
+        _summaryLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _summaryLabel.Font = new Font(Font, FontStyle.Bold);
+        root.Controls.Add(_summaryLabel, 0, 0);
+
+        _list.Dock = DockStyle.Fill;
+        _list.View = View.Details;
+        _list.FullRowSelect = true;
+        _list.GridLines = true;
+        _list.HideSelection = false;
+        _list.MultiSelect = false;
+        _list.Columns.Add("当前", 58);
+        _list.Columns.Add("名称", 140);
+        _list.Columns.Add("状态", 150);
+        _list.Columns.Add("版本", 150);
+        _list.Columns.Add("本地路径", 330);
+        _list.Columns.Add("SVN 地址", 360);
+        _list.DoubleClick += (_, _) => SetSelectedAsCurrent();
+        root.Controls.Add(_list, 0, 1);
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+        };
+        var closeButton = new Button { Text = "关闭", Width = 86, DialogResult = DialogResult.OK };
+        var refreshButton = new Button { Text = "刷新", Width = 86 };
+        var openButton = new Button { Text = "打开目录", Width = 96 };
+        var removeButton = new Button { Text = "移除", Width = 86 };
+        var renameButton = new Button { Text = "重命名", Width = 86 };
+        var currentButton = new Button { Text = "设为当前", Width = 96 };
+        refreshButton.Click += (_, _) => RefreshRows();
+        openButton.Click += (_, _) => OpenSelectedFolder();
+        removeButton.Click += (_, _) => RemoveSelected();
+        renameButton.Click += (_, _) => RenameSelected();
+        currentButton.Click += (_, _) => SetSelectedAsCurrent();
+        buttons.Controls.Add(closeButton);
+        buttons.Controls.Add(refreshButton);
+        buttons.Controls.Add(openButton);
+        buttons.Controls.Add(removeButton);
+        buttons.Controls.Add(renameButton);
+        buttons.Controls.Add(currentButton);
+        root.Controls.Add(buttons, 0, 2);
+
+        AcceptButton = closeButton;
+        RefreshRows();
+    }
+
+    public bool Changed { get; private set; }
+
+    private RepositoryEntry? SelectedRepository
+    {
+        get
+        {
+            if (_list.SelectedItems.Count == 0 || _list.SelectedItems[0].Tag is not string id)
+            {
+                return null;
+            }
+
+            return _settings.Repositories.FirstOrDefault(repository => repository.Id == id);
+        }
+    }
+
+    private void RefreshRows()
+    {
+        var selectedId = SelectedRepository?.Id ?? _settings.CurrentRepositoryId;
+        _list.BeginUpdate();
+        try
+        {
+            _list.Items.Clear();
+            foreach (var repository in _settings.Repositories.OrderBy(repository => repository.Name, StringComparer.CurrentCultureIgnoreCase))
+            {
+                var status = GetRepositoryStatus(repository, out var version);
+                var item = new ListViewItem(repository.Id == _settings.CurrentRepositoryId ? "√" : "")
+                {
+                    Tag = repository.Id,
+                    Font = repository.Id == _settings.CurrentRepositoryId ? new Font(_list.Font, FontStyle.Bold) : _list.Font,
+                    ForeColor = status.StartsWith("正常", StringComparison.Ordinal)
+                        ? SystemColors.WindowText
+                        : Color.FromArgb(170, 65, 45),
+                };
+                item.SubItems.Add(repository.Name);
+                item.SubItems.Add(status);
+                item.SubItems.Add(version);
+                item.SubItems.Add(repository.WorkingCopyPath);
+                item.SubItems.Add(repository.RepositoryUrl);
+                _list.Items.Add(item);
+                if (repository.Id == selectedId)
+                {
+                    item.Selected = true;
+                    item.Focused = true;
+                }
+            }
+        }
+        finally
+        {
+            _list.EndUpdate();
+        }
+
+        _summaryLabel.Text = $"本地库管理    共 {_settings.Repositories.Count} 个库";
+    }
+
+    private string GetRepositoryStatus(RepositoryEntry repository, out string version)
+    {
+        version = "-";
+        if (string.IsNullOrWhiteSpace(repository.WorkingCopyPath))
+        {
+            return "缺少本地路径";
+        }
+
+        if (!Directory.Exists(repository.WorkingCopyPath))
+        {
+            return "目录不存在";
+        }
+
+        if (!Directory.Exists(Path.Combine(repository.WorkingCopyPath, ".svn")))
+        {
+            return "不是 SVN 工作副本";
+        }
+
+        try
+        {
+            var info = _svn.GetWorkingCopyInfo(repository.WorkingCopyPath);
+            version = info == WorkingCopyInfo.Empty ? "未知" : info.DisplayRevisionText;
+            return "正常 SVN 工作副本";
+        }
+        catch
+        {
+            version = "读取失败";
+            return "SVN 信息读取失败";
+        }
+    }
+
+    private void SetSelectedAsCurrent()
+    {
+        var repository = SelectedRepository;
+        if (repository == null)
+        {
+            return;
+        }
+
+        _settings.CurrentRepositoryId = repository.Id;
+        Changed = true;
+        RefreshRows();
+    }
+
+    private void RenameSelected()
+    {
+        var repository = SelectedRepository;
+        if (repository == null)
+        {
+            return;
+        }
+
+        using var prompt = new TextPromptForm("重命名本地库", "名称", repository.Name);
+        if (prompt.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        repository.Name = prompt.Value;
+        Changed = true;
+        RefreshRows();
+    }
+
+    private void RemoveSelected()
+    {
+        var repository = SelectedRepository;
+        if (repository == null)
+        {
+            return;
+        }
+
+        var message =
+            $"确定从工具里移除这个本地库吗？{Environment.NewLine}{Environment.NewLine}" +
+            $"{repository.Name}{Environment.NewLine}" +
+            $"{repository.WorkingCopyPath}{Environment.NewLine}{Environment.NewLine}" +
+            "这只会从工具列表移除，不会删除磁盘上的文件。";
+        if (MessageBox.Show(this, message, "移除本地库", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+        {
+            return;
+        }
+
+        _settings.IgnoreWorkingCopy(repository.WorkingCopyPath);
+        _settings.Repositories.RemoveAll(item => item.Id == repository.Id);
+        if (string.Equals(_settings.CurrentRepositoryId, repository.Id, StringComparison.OrdinalIgnoreCase))
+        {
+            _settings.CurrentRepositoryId = _settings.Repositories.FirstOrDefault()?.Id;
+        }
+
+        if (_settings.Repositories.Count == 0)
+        {
+            _settings.CurrentRepositoryId = null;
+        }
+
+        Changed = true;
+        RefreshRows();
+    }
+
+    private void OpenSelectedFolder()
+    {
+        var repository = SelectedRepository;
+        if (repository == null)
+        {
+            return;
+        }
+
+        if (!Directory.Exists(repository.WorkingCopyPath))
+        {
+            MessageBox.Show(this, "本地目录不存在。", "无法打开", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        Process.Start(new ProcessStartInfo("explorer.exe", repository.WorkingCopyPath) { UseShellExecute = true });
+    }
+}
+
+internal sealed class TextPromptForm : Form
+{
+    private readonly TextBox _text = new();
+
+    public TextPromptForm(string title, string label, string initialValue)
+    {
+        Text = title;
+        StartPosition = FormStartPosition.CenterParent;
+        Width = 460;
+        Height = 150;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        MinimizeBox = false;
+        Font = new Font("Microsoft YaHei UI", 9F);
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            Padding = new Padding(12),
+            ColumnCount = 1,
+            RowCount = 3,
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        Controls.Add(root);
+
+        root.Controls.Add(new Label { Text = label, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 0, 0);
+        _text.Dock = DockStyle.Fill;
+        _text.Text = initialValue;
+        root.Controls.Add(_text, 0, 1);
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+        };
+        var cancelButton = new Button { Text = "取消", Width = 80, DialogResult = DialogResult.Cancel };
+        var okButton = new Button { Text = "确定", Width = 80 };
+        okButton.Click += (_, _) => SaveAndClose();
+        buttons.Controls.Add(cancelButton);
+        buttons.Controls.Add(okButton);
+        root.Controls.Add(buttons, 0, 2);
+
+        AcceptButton = okButton;
+        CancelButton = cancelButton;
+        Shown += (_, _) =>
+        {
+            _text.SelectAll();
+            _text.Focus();
+        };
+    }
+
+    public string Value => _text.Text.Trim();
+
+    private void SaveAndClose()
+    {
+        if (string.IsNullOrWhiteSpace(Value))
+        {
+            MessageBox.Show(this, "名称不能为空。", "缺少名称", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        DialogResult = DialogResult.OK;
+        Close();
     }
 }
 
