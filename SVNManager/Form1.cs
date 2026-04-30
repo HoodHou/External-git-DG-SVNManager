@@ -68,6 +68,7 @@ public partial class Form1 : Form
     private ReleaseUpdateStatus? _lastReleaseUpdateStatus;
     private readonly HashSet<string> _selectedFileTreePaths = new(StringComparer.OrdinalIgnoreCase);
     private string? _fileTreeSelectionAnchorPath;
+    private CancellationTokenSource? _fileTreeLoadCts;
     private SvnLogEntry? _selectedHistoryLog;
     private List<SvnLogEntry> _selectedHistoryLogs = [];
     private List<SvnLogEntry> _historyRows = [];
@@ -101,6 +102,7 @@ public partial class Form1 : Form
         FormClosing += (_, _) =>
         {
             _remoteCheckTimer.Stop();
+            CancelFileTreeLoad();
             CancelHistoryDiffPreview();
             SaveUiLayout();
         };
@@ -2888,6 +2890,11 @@ try {{
 
     private void LoadAllFiles()
     {
+        _ = LoadAllFilesAsync();
+    }
+
+    private async Task LoadAllFilesAsync()
+    {
         var root = _workingCopyText.Text.Trim();
         var search = _fileTreeSearchText.Text.Trim();
         var changedOnly = _fileTreeChangedOnlyCheck.Checked;
@@ -2898,65 +2905,162 @@ try {{
             expandedPaths = _settings.GetExpandedPaths(root);
         }
 
+        CancelFileTreeLoad();
+        var loadCts = new CancellationTokenSource();
+        _fileTreeLoadCts = loadCts;
+        var token = loadCts.Token;
+        var request = new FileTreeLoadRequest(root, search, changedOnly, isFiltering, expandedPaths);
+        ShowFileTreeMessage(string.IsNullOrWhiteSpace(root) ? "请选择本地目录。" : "正在加载文件树...");
+        _fileTreeRefreshButton.Enabled = false;
+        _statusLabel.Text = "正在加载全部文件...";
+        try
+        {
+            var result = await Task.Run(() => BuildFileTree(request, token), token);
+            if (!IsCurrentFileTreeLoad(loadCts) || token.IsCancellationRequested)
+            {
+                return;
+            }
+
+            ApplyFileTreeBuildResult(result);
+            _statusLabel.Text = result.RootNode == null ? "就绪" : $"已加载 {result.FileCount} 个文件";
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            if (!token.IsCancellationRequested && IsCurrentFileTreeLoad(loadCts))
+            {
+                ShowFileTreeMessage("文件树加载失败，请查看终端输出。");
+                WriteOutput(ex.ToString());
+                _statusLabel.Text = "就绪";
+            }
+        }
+        finally
+        {
+            if (IsCurrentFileTreeLoad(loadCts))
+            {
+                _fileTreeLoadCts = null;
+                _fileTreeRefreshButton.Enabled = true;
+            }
+        }
+    }
+
+    private void CancelFileTreeLoad()
+    {
+        try
+        {
+            _fileTreeLoadCts?.Cancel();
+        }
+        catch
+        {
+        }
+    }
+
+    private bool IsCurrentFileTreeLoad(CancellationTokenSource loadCts)
+    {
+        return ReferenceEquals(_fileTreeLoadCts, loadCts);
+    }
+
+    private FileTreeBuildResult BuildFileTree(FileTreeLoadRequest request, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        if (string.IsNullOrWhiteSpace(request.RootPath))
+        {
+            return new FileTreeBuildResult(null, "请选择本地目录。", 0, request.IsFiltering, request.ExpandedPaths);
+        }
+
+        if (!Directory.Exists(request.RootPath))
+        {
+            return new FileTreeBuildResult(null, "本地目录不存在。", 0, request.IsFiltering, request.ExpandedPaths);
+        }
+
+        var rootInfo = new DirectoryInfo(request.RootPath);
+        var rootNode = new TreeNode(rootInfo.Name)
+        {
+            Tag = new FileTreeNodeInfo("", false),
+            ToolTipText = request.RootPath,
+            ImageKey = "folder",
+            SelectedImageKey = "folder",
+        };
+
+        var statusMap = GetStatusMapForTree(request.RootPath);
+        token.ThrowIfCancellationRequested();
+        var files = Directory.EnumerateFiles(request.RootPath, "*", SearchOption.AllDirectories)
+            .Where(path => !path.Contains($"{Path.DirectorySeparatorChar}.svn{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
+            .Where(path => !SvnConflictArtifact.IsAuxiliaryPath(Path.GetRelativePath(request.RootPath, path)))
+            .Select(path => new FileInfo(path))
+            .Where(file =>
+            {
+                token.ThrowIfCancellationRequested();
+                var relativePath = Path.GetRelativePath(request.RootPath, file.FullName);
+                var normalized = NormalizeRelativePath(relativePath);
+                var hasStatus = statusMap.TryGetValue(normalized, out var status) && status != SvnStatusKind.None && status != SvnStatusKind.Normal;
+                if (request.ChangedOnly && !hasStatus)
+                {
+                    return false;
+                }
+
+                return string.IsNullOrWhiteSpace(request.Search) ||
+                    relativePath.Contains(request.Search, StringComparison.OrdinalIgnoreCase) ||
+                    file.Name.Contains(request.Search, StringComparison.OrdinalIgnoreCase);
+            })
+            .OrderBy(file => Path.GetRelativePath(request.RootPath, file.FullName), StringComparer.CurrentCultureIgnoreCase)
+            .ToList();
+
+        foreach (var file in files)
+        {
+            token.ThrowIfCancellationRequested();
+            var relativePath = Path.GetRelativePath(request.RootPath, file.FullName);
+            statusMap.TryGetValue(NormalizeRelativePath(relativePath), out var status);
+            AddFileNode(rootNode, relativePath, file, status);
+        }
+
+        return new FileTreeBuildResult(rootNode, "", files.Count, request.IsFiltering, request.ExpandedPaths);
+    }
+
+    private void ApplyFileTreeBuildResult(FileTreeBuildResult result)
+    {
         _loadingFileTree = true;
         _fileTree.BeginUpdate();
         _fileTree.Nodes.Clear();
         try
         {
-            if (!Directory.Exists(root))
+            if (result.RootNode == null)
             {
+                _fileTree.Nodes.Add(new TreeNode(result.Message));
                 return;
             }
 
-            var rootInfo = new DirectoryInfo(root);
-            var rootNode = new TreeNode(rootInfo.Name)
+            _fileTree.Nodes.Add(result.RootNode);
+            if (result.IsFiltering)
             {
-                Tag = new FileTreeNodeInfo("", false),
-                ToolTipText = root,
-                ImageKey = "folder",
-                SelectedImageKey = "folder",
-            };
-            _fileTree.Nodes.Add(rootNode);
-            var statusMap = GetStatusMapForTree();
-            var files = Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
-                .Where(path => !path.Contains($"{Path.DirectorySeparatorChar}.svn{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
-                .Where(path => !SvnConflictArtifact.IsAuxiliaryPath(Path.GetRelativePath(root, path)))
-                .Select(path => new FileInfo(path))
-                .Where(file =>
-                {
-                    var relativePath = Path.GetRelativePath(root, file.FullName);
-                    var normalized = NormalizeRelativePath(relativePath);
-                    var hasStatus = statusMap.TryGetValue(normalized, out var status) && status != SvnStatusKind.None && status != SvnStatusKind.Normal;
-                    if (changedOnly && !hasStatus)
-                    {
-                        return false;
-                    }
-
-                    return string.IsNullOrWhiteSpace(search) ||
-                        relativePath.Contains(search, StringComparison.OrdinalIgnoreCase) ||
-                        file.Name.Contains(search, StringComparison.OrdinalIgnoreCase);
-                })
-                .OrderBy(file => Path.GetRelativePath(root, file.FullName))
-                .ToList();
-
-            foreach (var file in files)
-            {
-                var relativePath = Path.GetRelativePath(root, file.FullName);
-                statusMap.TryGetValue(NormalizeRelativePath(relativePath), out var status);
-                AddFileNode(rootNode, relativePath, file, status);
-            }
-            if (isFiltering)
-            {
-                rootNode.ExpandAll();
+                result.RootNode.ExpandAll();
             }
             else
             {
-                RestoreExpandedTreePaths(expandedPaths);
+                RestoreExpandedTreePaths(result.ExpandedPaths);
             }
 
             _fileTree.Sort();
             PruneFileTreeSelection();
             ApplyFileTreeSelectionStyles();
+        }
+        finally
+        {
+            _fileTree.EndUpdate();
+            _loadingFileTree = false;
+        }
+    }
+
+    private void ShowFileTreeMessage(string message)
+    {
+        _loadingFileTree = true;
+        _fileTree.BeginUpdate();
+        try
+        {
+            _fileTree.Nodes.Clear();
+            _fileTree.Nodes.Add(new TreeNode(message));
         }
         finally
         {
@@ -3380,11 +3484,11 @@ try {{
         return bytes >= 1024 ? $"{bytes / 1024d:0.##} KB" : $"{bytes} B";
     }
 
-    private Dictionary<string, SvnStatusKind> GetStatusMapForTree()
+    private Dictionary<string, SvnStatusKind> GetStatusMapForTree(string workingCopyPath)
     {
         try
         {
-            return _svn.GetStatus(_workingCopyText.Text.Trim())
+            return _svn.GetStatus(workingCopyPath)
                 .ToDictionary(change => NormalizeRelativePath(change.RelativePath), change => change.Status, StringComparer.OrdinalIgnoreCase);
         }
         catch
@@ -4952,7 +5056,7 @@ try {{
                     return;
                 }
 
-                await PrepareRangeDiffFilesAsync(_svn, workingCopy, firstRevision, lastRevision, file, oldTemp, newTemp);
+                await PrepareRangeDiffFilesAsync(_svn, workingCopy, firstRevision, lastRevision, file, oldTemp, newTemp, token);
                 await ShowDiffPreviewAsync(title, oldTemp, newTemp, cacheKey, token);
                 return;
             }
@@ -4988,7 +5092,7 @@ try {{
                     return;
                 }
 
-                await PrepareUncommittedDiffFilesAsync(workingCopy, file, oldTemp, newTemp);
+                await PrepareUncommittedDiffFilesAsync(workingCopy, file, oldTemp, newTemp, token);
                 await ShowDiffPreviewAsync(title, oldTemp, newTemp, cacheKey, token);
             }
             else
@@ -5000,7 +5104,7 @@ try {{
                     return;
                 }
 
-                await PrepareCommittedDiffFilesAsync(_svn, workingCopy, _selectedHistoryLog.Revision, file, oldTemp, newTemp);
+                await PrepareCommittedDiffFilesAsync(_svn, workingCopy, _selectedHistoryLog.Revision, file, oldTemp, newTemp, token);
                 await ShowDiffPreviewAsync(title, oldTemp, newTemp, cacheKey, token);
             }
         }
@@ -5025,24 +5129,27 @@ try {{
         }
     }
 
-    private async Task PrepareUncommittedDiffFilesAsync(string workingCopy, ChangedFileEntry file, string oldTemp, string newTemp)
+    private async Task PrepareUncommittedDiffFilesAsync(string workingCopy, ChangedFileEntry file, string oldTemp, string newTemp, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var localPath = Path.Combine(workingCopy, file.RelativePath);
         if (file.Action is "A" or "?")
         {
             File.WriteAllText(oldTemp, "");
+            cancellationToken.ThrowIfCancellationRequested();
             File.Copy(localPath, newTemp, true);
             return;
         }
 
         if (file.Action is "D" or "!")
         {
-            await _svn.WriteBaseFileAsync(workingCopy, file.RelativePath, oldTemp);
+            await _svn.WriteBaseFileAsync(workingCopy, file.RelativePath, oldTemp, cancellationToken);
             File.WriteAllText(newTemp, "");
             return;
         }
 
-        await _svn.WriteBaseFileAsync(workingCopy, file.RelativePath, oldTemp);
+        await _svn.WriteBaseFileAsync(workingCopy, file.RelativePath, oldTemp, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
         File.Copy(localPath, newTemp, true);
     }
 
@@ -5178,24 +5285,25 @@ try {{
         }
     }
 
-    internal static async Task PrepareCommittedDiffFilesAsync(SvnClient svn, string workingCopy, long revision, ChangedFileEntry file, string oldTemp, string newTemp)
+    internal static async Task PrepareCommittedDiffFilesAsync(SvnClient svn, string workingCopy, long revision, ChangedFileEntry file, string oldTemp, string newTemp, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (file.Action == "A")
         {
             File.WriteAllText(oldTemp, "");
-            await svn.WriteRepositoryFileAtRevisionAsync(workingCopy, file.RepositoryPath, revision, newTemp);
+            await svn.WriteRepositoryFileAtRevisionAsync(workingCopy, file.RepositoryPath, revision, newTemp, cancellationToken);
             return;
         }
 
         if (file.Action == "D")
         {
-            await svn.WriteRepositoryFileAtRevisionAsync(workingCopy, file.RepositoryPath, revision - 1, oldTemp);
+            await svn.WriteRepositoryFileAtRevisionAsync(workingCopy, file.RepositoryPath, revision - 1, oldTemp, cancellationToken);
             File.WriteAllText(newTemp, "");
             return;
         }
 
-        await svn.WriteRepositoryFileAtRevisionAsync(workingCopy, file.RepositoryPath, revision - 1, oldTemp);
-        await svn.WriteRepositoryFileAtRevisionAsync(workingCopy, file.RepositoryPath, revision, newTemp);
+        await svn.WriteRepositoryFileAtRevisionAsync(workingCopy, file.RepositoryPath, revision - 1, oldTemp, cancellationToken);
+        await svn.WriteRepositoryFileAtRevisionAsync(workingCopy, file.RepositoryPath, revision, newTemp, cancellationToken);
     }
 
     internal static async Task PrepareRangeDiffFilesAsync(
@@ -5205,17 +5313,22 @@ try {{
         long lastRevision,
         ChangedFileEntry file,
         string oldTemp,
-        string newTemp)
+        string newTemp,
+        CancellationToken cancellationToken = default)
     {
-        await TryWriteRepositoryFileAtRevisionAsync(svn, workingCopy, file.RepositoryPath, firstRevision - 1, oldTemp);
-        await TryWriteRepositoryFileAtRevisionAsync(svn, workingCopy, file.RepositoryPath, lastRevision, newTemp);
+        await TryWriteRepositoryFileAtRevisionAsync(svn, workingCopy, file.RepositoryPath, firstRevision - 1, oldTemp, cancellationToken);
+        await TryWriteRepositoryFileAtRevisionAsync(svn, workingCopy, file.RepositoryPath, lastRevision, newTemp, cancellationToken);
     }
 
-    private static async Task TryWriteRepositoryFileAtRevisionAsync(SvnClient svn, string workingCopy, string repositoryPath, long revision, string outputPath)
+    private static async Task TryWriteRepositoryFileAtRevisionAsync(SvnClient svn, string workingCopy, string repositoryPath, long revision, string outputPath, CancellationToken cancellationToken = default)
     {
         try
         {
-            await svn.WriteRepositoryFileAtRevisionAsync(workingCopy, repositoryPath, revision, outputPath);
+            await svn.WriteRepositoryFileAtRevisionAsync(workingCopy, repositoryPath, revision, outputPath, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch
         {
@@ -5978,19 +6091,19 @@ internal sealed class SvnClient
         return RunAsync(workingCopyPath, args.ToArray());
     }
 
-    public async Task WriteBaseFileAsync(string workingCopyPath, string relativePath, string outputPath)
+    public async Task WriteBaseFileAsync(string workingCopyPath, string relativePath, string outputPath, CancellationToken cancellationToken = default)
     {
-        var result = await RunBinaryToFileAsync(workingCopyPath, outputPath, "cat", "-r", "BASE", relativePath);
+        var result = await RunBinaryToFileAsync(workingCopyPath, outputPath, cancellationToken, "cat", "-r", "BASE", relativePath);
         if (result.ExitCode != 0)
         {
             throw new InvalidOperationException(result.CombinedOutput);
         }
     }
 
-    public async Task WriteRepositoryFileAtRevisionAsync(string workingCopyPath, string repositoryPath, long revision, string outputPath)
+    public async Task WriteRepositoryFileAtRevisionAsync(string workingCopyPath, string repositoryPath, long revision, string outputPath, CancellationToken cancellationToken = default)
     {
         var path = repositoryPath.StartsWith("^", StringComparison.Ordinal) ? repositoryPath : "^" + repositoryPath;
-        var result = await RunBinaryToFileAsync(workingCopyPath, outputPath, "cat", "-r", revision.ToString(), path);
+        var result = await RunBinaryToFileAsync(workingCopyPath, outputPath, cancellationToken, "cat", "-r", revision.ToString(), path);
         if (result.ExitCode != 0)
         {
             throw new InvalidOperationException(result.CombinedOutput);
@@ -6385,7 +6498,7 @@ internal sealed class SvnClient
         return new ProcessResult(process.ExitCode, stdout, stderr);
     }
 
-    private static async Task<ProcessResult> RunBinaryToFileAsync(string? workingDirectory, string outputPath, params string[] arguments)
+    private static async Task<ProcessResult> RunBinaryToFileAsync(string? workingDirectory, string outputPath, CancellationToken cancellationToken = default, params string[] arguments)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -6404,12 +6517,35 @@ internal sealed class SvnClient
 
         using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("无法启动 svn 命令。");
         await using var output = File.Create(outputPath);
-        var copyTask = process.StandardOutput.BaseStream.CopyToAsync(output);
-        var stderrTask = process.StandardError.ReadToEndAsync();
-        await process.WaitForExitAsync();
-        await copyTask;
-        var stderr = await stderrTask;
-        return new ProcessResult(process.ExitCode, "", stderr);
+        var copyTask = process.StandardOutput.BaseStream.CopyToAsync(output, cancellationToken);
+        var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
+        try
+        {
+            await process.WaitForExitAsync(cancellationToken);
+            await copyTask;
+            var stderr = await stderrTask;
+            return new ProcessResult(process.ExitCode, "", stderr);
+        }
+        catch (OperationCanceledException)
+        {
+            TryKillProcess(process);
+            throw;
+        }
+    }
+
+    private static void TryKillProcess(Process process)
+    {
+        try
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+            }
+        }
+        catch
+        {
+            // Canceling stale diff previews should not surface process cleanup errors.
+        }
     }
 }
 
@@ -7762,6 +7898,20 @@ internal sealed record ConflictGridRow(string RelativePath, string Description);
 
 internal sealed record FileTreeNodeInfo(string RelativePath, bool IsFile);
 
+internal sealed record FileTreeLoadRequest(
+    string RootPath,
+    string Search,
+    bool ChangedOnly,
+    bool IsFiltering,
+    HashSet<string> ExpandedPaths);
+
+internal sealed record FileTreeBuildResult(
+    TreeNode? RootNode,
+    string Message,
+    int FileCount,
+    bool IsFiltering,
+    HashSet<string> ExpandedPaths);
+
 internal sealed record IgnoreGroup(string ParentPath, IReadOnlyList<string> Names);
 
 internal sealed record CleanupOptions(
@@ -8899,7 +9049,7 @@ internal sealed class FileHistoryForm : Form
         ShowDiffLoading(title, "正在准备文件版本...");
         try
         {
-            await Form1.PrepareCommittedDiffFilesAsync(_svn, _workingCopy, log.Revision, file, oldTemp, newTemp);
+            await Form1.PrepareCommittedDiffFilesAsync(_svn, _workingCopy, log.Revision, file, oldTemp, newTemp, token);
             await ShowDiffPreviewAsync(title, oldTemp, newTemp, cacheKey, token);
         }
         catch (OperationCanceledException)
@@ -8969,7 +9119,7 @@ internal sealed class FileHistoryForm : Form
         ShowDiffLoading(title, "正在准备文件版本...");
         try
         {
-            await Form1.PrepareCommittedDiffFilesAsync(_svn, _workingCopy, log.Revision, file, oldTemp, newTemp);
+            await Form1.PrepareCommittedDiffFilesAsync(_svn, _workingCopy, log.Revision, file, oldTemp, newTemp, token);
             await ShowDiffPreviewAsync(title, oldTemp, newTemp, cacheKey, token);
         }
         catch (OperationCanceledException)
