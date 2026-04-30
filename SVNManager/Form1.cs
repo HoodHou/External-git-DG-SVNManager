@@ -134,6 +134,10 @@ public partial class Form1 : Form
         _repositorySelector.SelectedIndexChanged += (_, _) => SelectRepositoryFromList();
         toolbar.Controls.Add(_repositorySelector);
 
+        var importRepositoryButton = new Button { Text = "导入/检出库", Width = 110 };
+        importRepositoryButton.Click += (_, _) => SelectTab("配置");
+        toolbar.Controls.Add(importRepositoryButton);
+
         var saveRepositoryButton = new Button { Text = "保存库", Width = 82 };
         saveRepositoryButton.Click += (_, _) => SaveCurrentRepository();
         toolbar.Controls.Add(saveRepositoryButton);
@@ -382,7 +386,7 @@ public partial class Form1 : Form
         var chooseButton = new Button { Text = "选择", Dock = DockStyle.Fill };
         chooseButton.Click += (_, _) => ChooseWorkingCopy();
         fields.Controls.Add(chooseButton, 2, 1);
-        root.Controls.Add(CreateTitledPanel("当前库配置", fields), 0, 0);
+        root.Controls.Add(CreateTitledPanel("导入 / 检出 SVN 库", fields), 0, 0);
 
         var actions = new FlowLayoutPanel
         {
@@ -392,7 +396,8 @@ public partial class Form1 : Form
             WrapContents = true,
             Padding = new Padding(0, 12, 0, 0),
         };
-        actions.Controls.Add(CreateActionButton("保存库", SaveCurrentRepository, 92));
+        actions.Controls.Add(CreateActionButton("导入已有工作副本", ChooseWorkingCopy, 132));
+        actions.Controls.Add(CreateActionButton("保存当前库", SaveCurrentRepository, 104));
         actions.Controls.Add(CreateActionButton("移除当前库", RemoveCurrentRepository, 104));
         actions.Controls.Add(CreateActionButton("打开目录", OpenWorkingCopyFolder, 92));
         actions.Controls.Add(CreateActionButton("设置", ShowSettingsDialog, 82));
@@ -502,7 +507,7 @@ public partial class Form1 : Form
         _moreActionsMenu.Items.Add("冲突处理", null, async (_, _) => await RunConflictWorkflowAsync());
         _moreActionsMenu.Items.Add("文件历史", null, async (_, _) => await RunFileHistoryAsync());
         _moreActionsMenu.Items.Add(new ToolStripSeparator());
-        _moreActionsMenu.Items.Add("SVN Clean Up", null, async (_, _) => await RunCleanupAsync());
+        _moreActionsMenu.Items.Add("SVN 清理工作副本", null, async (_, _) => await RunCleanupAsync());
         _moreActionsMenu.Items.Add("查看忽略清单", null, async (_, _) => await ShowIgnoreListAsync());
         _moreActionsMenu.Items.Add(new ToolStripSeparator());
         _moreActionsMenu.Items.Add("全部文件：刷新", null, (_, _) => LoadAllFiles());
@@ -1003,7 +1008,7 @@ public partial class Form1 : Form
         }
 
         OperationLogger.Log("CleanupStart", workingCopy, options.ToLogText());
-        var result = await RunSvnOperationAsync("正在执行 SVN Clean Up...", async () => await _svn.CleanupAsync(workingCopy, options));
+        var result = await RunSvnOperationAsync("正在执行 SVN 清理...", async () => await _svn.CleanupAsync(workingCopy, options));
         OperationLogger.Log(result?.ExitCode == 0 ? "CleanupSuccess" : "CleanupFailed", workingCopy, "");
         await RefreshStatusAsync();
         LoadAllFiles();
@@ -5565,7 +5570,7 @@ internal sealed class SvnClient
 
         if (options.RefreshShellOverlays)
         {
-            output.AppendLine("Refresh shell overlays 是 TortoiseSVN 的外壳刷新项；本工具已在操作后刷新自身状态。");
+            output.AppendLine("刷新资源管理器图标覆盖是 TortoiseSVN 的外壳刷新项；本工具已在操作后刷新自身状态。");
         }
 
         if (output.Length == 0)
@@ -7495,15 +7500,15 @@ internal sealed record CleanupOptions(
 
 internal sealed class CleanupOptionsForm : Form
 {
-    private readonly CheckBox _cleanStatus = new() { Text = "Clean up working copy status", Checked = true, AutoSize = true };
-    private readonly CheckBox _breakLocks = new() { Text = "Break write locks", Checked = true, AutoSize = true };
-    private readonly CheckBox _fixTimeStamps = new() { Text = "Fix time stamps", Checked = true, AutoSize = true };
-    private readonly CheckBox _vacuumPristines = new() { Text = "Vacuum pristine copies", Checked = true, AutoSize = true };
-    private readonly CheckBox _refreshOverlays = new() { Text = "Refresh shell overlays", Checked = true, AutoSize = true };
-    private readonly CheckBox _includeExternals = new() { Text = "Include externals", Checked = true, AutoSize = true };
-    private readonly CheckBox _deleteUnversioned = new() { Text = "Delete unversioned files and folders", AutoSize = true };
-    private readonly CheckBox _deleteIgnored = new() { Text = "Delete ignored files and folders", AutoSize = true };
-    private readonly CheckBox _revertAll = new() { Text = "Revert all changes recursively", AutoSize = true };
+    private readonly CheckBox _cleanStatus = new() { Text = "清理工作副本状态", Checked = true, AutoSize = true };
+    private readonly CheckBox _breakLocks = new() { Text = "解除写入锁", Checked = true, AutoSize = true };
+    private readonly CheckBox _fixTimeStamps = new() { Text = "修复文件时间戳", Checked = true, AutoSize = true };
+    private readonly CheckBox _vacuumPristines = new() { Text = "清理 .svn 内未使用的原始副本", Checked = true, AutoSize = true };
+    private readonly CheckBox _refreshOverlays = new() { Text = "刷新资源管理器图标覆盖", Checked = true, AutoSize = true };
+    private readonly CheckBox _includeExternals = new() { Text = "包含 externals 外部目录", Checked = true, AutoSize = true };
+    private readonly CheckBox _deleteUnversioned = new() { Text = "删除未加入版本控制的文件和文件夹", AutoSize = true };
+    private readonly CheckBox _deleteIgnored = new() { Text = "删除已忽略的文件和文件夹", AutoSize = true };
+    private readonly CheckBox _revertAll = new() { Text = "递归还原所有本地改动", AutoSize = true };
 
     public CleanupOptions Options => new(
         _cleanStatus.Checked,
@@ -7518,26 +7523,36 @@ internal sealed class CleanupOptionsForm : Form
 
     public CleanupOptionsForm(string workingCopyPath)
     {
-        Text = workingCopyPath;
+        Text = "SVN 清理工作副本";
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
-        Width = 500;
-        Height = 365;
+        Width = 560;
+        Height = 410;
         Font = new Font("Microsoft YaHei UI", 9F);
 
         var root = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 3,
+            RowCount = 4,
             Padding = new Padding(16, 14, 16, 12),
         };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
         Controls.Add(root);
+
+        root.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Text = workingCopyPath,
+            AutoEllipsis = true,
+            Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+        }, 0, 0);
 
         var options = new FlowLayoutPanel
         {
@@ -7562,16 +7577,16 @@ internal sealed class CleanupOptionsForm : Form
             options.Controls.Add(checkBox);
         }
 
-        root.Controls.Add(options, 0, 0);
+        root.Controls.Add(options, 0, 1);
 
         var hint = new Label
         {
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
             ForeColor = Color.FromArgb(110, 70, 20),
-            Text = "删除和递归还原类选项默认关闭，执行前会再次确认。",
+            Text = "删除和递归还原类选项默认关闭，执行前会再次确认；“时间戳/图标覆盖”属于 TortoiseSVN 体验项，本工具会尽量刷新自身状态。",
         };
-        root.Controls.Add(hint, 0, 1);
+        root.Controls.Add(hint, 0, 2);
 
         var buttons = new FlowLayoutPanel
         {
@@ -7579,11 +7594,11 @@ internal sealed class CleanupOptionsForm : Form
             FlowDirection = FlowDirection.RightToLeft,
             WrapContents = false,
         };
-        var ok = new Button { Text = "OK", Width = 88, DialogResult = DialogResult.OK };
-        var cancel = new Button { Text = "Cancel", Width = 88, DialogResult = DialogResult.Cancel };
+        var ok = new Button { Text = "确定", Width = 88, DialogResult = DialogResult.OK };
+        var cancel = new Button { Text = "取消", Width = 88, DialogResult = DialogResult.Cancel };
         buttons.Controls.Add(ok);
         buttons.Controls.Add(cancel);
-        root.Controls.Add(buttons, 0, 2);
+        root.Controls.Add(buttons, 0, 3);
 
         AcceptButton = ok;
         CancelButton = cancel;
