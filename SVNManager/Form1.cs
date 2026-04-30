@@ -3044,6 +3044,11 @@ try {{
 
     private static void AddFileNode(TreeNode rootNode, string relativePath, FileInfo file, SvnStatusKind status)
     {
+        if (IsReservedDevicePath(relativePath))
+        {
+            return;
+        }
+
         var parts = relativePath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         var current = rootNode;
         var currentPath = "";
@@ -3055,12 +3060,13 @@ try {{
             var existing = current.Nodes.Cast<TreeNode>().FirstOrDefault(node => string.Equals(CleanTreeNodeText(node.Text), part, StringComparison.OrdinalIgnoreCase));
             if (existing == null)
             {
+                var tooltip = isFile
+                    ? BuildFileTooltip(currentPath, file)
+                    : currentPath;
                 existing = new TreeNode(part)
                 {
                     Tag = new FileTreeNodeInfo(currentPath, isFile),
-                    ToolTipText = isFile
-                        ? $"{currentPath}\r\n修改时间：{file.LastWriteTime:yyyy-MM-dd HH:mm}\r\n大小：{FormatBytes(file.Length)}"
-                        : currentPath,
+                    ToolTipText = tooltip,
                     ImageKey = isFile ? FileImageKey(currentPath, status) : "folder",
                     SelectedImageKey = isFile ? FileImageKey(currentPath, status) : "folder",
                     ForeColor = isFile ? SystemColors.WindowText : Color.FromArgb(55, 65, 81),
@@ -3084,6 +3090,56 @@ try {{
 
             current = existing;
         }
+    }
+
+    private static string BuildFileTooltip(string relativePath, FileInfo file)
+    {
+        try
+        {
+            return $"{relativePath}\r\n修改时间：{file.LastWriteTime:yyyy-MM-dd HH:mm}\r\n大小：{FormatBytes(file.Length)}";
+        }
+        catch (IOException)
+        {
+            return relativePath;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return relativePath;
+        }
+    }
+
+    private static bool IsReservedDevicePath(string relativePath)
+    {
+        return relativePath
+            .Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            .Any(IsReservedDeviceName);
+    }
+
+    private static bool IsReservedDeviceName(string name)
+    {
+        var baseName = Path.GetFileNameWithoutExtension(name).TrimEnd(' ');
+        if (string.IsNullOrWhiteSpace(baseName))
+        {
+            return false;
+        }
+
+        if (baseName.Equals("CON", StringComparison.OrdinalIgnoreCase) ||
+            baseName.Equals("PRN", StringComparison.OrdinalIgnoreCase) ||
+            baseName.Equals("AUX", StringComparison.OrdinalIgnoreCase) ||
+            baseName.Equals("NUL", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (baseName.Length == 4 &&
+            (baseName.StartsWith("COM", StringComparison.OrdinalIgnoreCase) ||
+             baseName.StartsWith("LPT", StringComparison.OrdinalIgnoreCase)) &&
+            baseName[3] is >= '1' and <= '9')
+        {
+            return true;
+        }
+
+        return false;
     }
 
     private static string FileImageKey(string path, SvnStatusKind status)
@@ -4281,19 +4337,35 @@ try {{
 
     private void RemoveCurrentRepository()
     {
-        if (_settings.CurrentRepositoryId == null)
+        var repository = GetRepositorySelectedForRemoval();
+        if (repository == null)
+        {
+            MessageBox.Show("请先在左侧本地库或顶部下拉框里选中要移除的库。", "没有选中本地库", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var message =
+            $"确定从工具里移除这个本地库吗？{Environment.NewLine}{Environment.NewLine}" +
+            $"{repository.Name}{Environment.NewLine}" +
+            $"{repository.WorkingCopyPath}{Environment.NewLine}{Environment.NewLine}" +
+            "这只会从工具列表移除，不会删除磁盘上的文件。";
+        if (MessageBox.Show(message, "移除本地库", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
         {
             return;
         }
 
-        var removedRepository = _settings.Repositories.FirstOrDefault(repository => repository.Id == _settings.CurrentRepositoryId);
-        if (removedRepository != null)
+        _settings.IgnoreWorkingCopy(repository.WorkingCopyPath);
+        _settings.Repositories.RemoveAll(item => item.Id == repository.Id);
+        if (string.Equals(_settings.CurrentRepositoryId, repository.Id, StringComparison.OrdinalIgnoreCase))
         {
-            _settings.IgnoreWorkingCopy(removedRepository.WorkingCopyPath);
+            _settings.CurrentRepositoryId = _settings.Repositories.FirstOrDefault()?.Id;
         }
 
-        _settings.Repositories.RemoveAll(repository => repository.Id == _settings.CurrentRepositoryId);
-        _settings.CurrentRepositoryId = _settings.Repositories.FirstOrDefault()?.Id;
+        if (_settings.Repositories.Count == 0)
+        {
+            _settings.CurrentRepositoryId = null;
+        }
+
         _settings.Save();
         RefreshRepositorySelector();
         RefreshConflictPanel([]);
@@ -4307,6 +4379,22 @@ try {{
         _workingCopyText.Text = selected?.WorkingCopyPath ?? "";
         _changesList.Items.Clear();
         LoadAllFiles();
+        WriteOutput($"已从本地库列表移除：{repository.Name}");
+    }
+
+    private RepositoryEntry? GetRepositorySelectedForRemoval()
+    {
+        if (_repositoryTree.SelectedNode?.Tag is RepositoryEntry treeRepository)
+        {
+            return treeRepository;
+        }
+
+        if (_repositorySelector.SelectedItem is RepositoryEntry selectorRepository)
+        {
+            return selectorRepository;
+        }
+
+        return _settings.GetCurrentRepository();
     }
 
     private void RefreshRepositorySelector()
